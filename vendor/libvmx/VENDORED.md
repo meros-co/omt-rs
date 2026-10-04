@@ -13,7 +13,7 @@ when its OMT code became omt-rs.
 
 ## Local patches
 
-One, kept as small as possible so an upstream refresh is easy to re-apply:
+Two, kept as small as possible so an upstream refresh is easy to re-apply:
 
 - `src/vmxcodec.h` — the `_MSC_VER` arm of the `VMX_API` macro gained
   `extern "C"`. Upstream defines it as bare `__declspec(dllexport)` while the
@@ -22,6 +22,11 @@ One, kept as small as possible so an upstream refresh is easy to re-apply:
   declarations in `vmx.rs` fail to link (`unresolved external symbol
   VMX_Create`). Upstream consumes the library from C++ via this same header,
   which is why the asymmetry went unnoticed there.
+- `src/thread_tasks.h` — both condition-variable waits gained predicates.
+  `TaskLoop` read `running` outside the lock and then waited, so a
+  `Destroy` landing in between lost its wake-up and `thread.join()` hung
+  forever (seen as `VMX_SetThreads` deadlocking when a sender starts while
+  other encoders run); `Join` could also return on a spurious wake-up.
 
 To update: clone upstream at the desired commit, replace this directory's
 contents (keep this file), update the pinned commit above, and re-run the

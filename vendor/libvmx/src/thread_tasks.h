@@ -42,10 +42,7 @@ struct ThreadTask
 	void Join()
 	{
 		std::unique_lock<std::mutex> lock(mtx);
-		if (queue.size() > 0)
-		{
-			complete.wait(lock);
-		}
+		complete.wait(lock, [this] { return queue.size() == 0; });
 	}
 
 	void TaskLoop()
@@ -56,7 +53,7 @@ struct ThreadTask
 			if (queue.size() == 0)
 			{
 				complete.notify_all();
-				cv.wait(lock);
+				cv.wait(lock, [this] { return !running || queue.size() > 0; });
 			}
 			if (!running) break;
 			std::function<void()> func = NULL;
