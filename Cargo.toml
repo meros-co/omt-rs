@@ -10,3 +10,8 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/meros-co/omt-rs"
 rust-version = "1.85"
+
+# The clock-recovery tests simulate eight hours of frames; optimise test
+# builds so they take seconds, not minutes. Affects this workspace only.
+[profile.test]
+opt-level = 2

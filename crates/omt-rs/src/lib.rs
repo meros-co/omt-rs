@@ -8,6 +8,7 @@
 //! * [`metadata`] - tally and sender information, as libomt writes them.
 //! * [`protocol`] - the wire format.
 //! * [`net`] - pin OMT to one network interface on a multi-homed machine.
+//! * [`sync`] - clock recovery: drift-free timestamps and audio that follows them.
 //!
 //! The protocol layer is pure Rust, written against the open spec and checked
 //! against the reference implementation (`openmediatransport/libomt`) where
@@ -21,6 +22,7 @@ pub mod net;
 pub mod protocol;
 pub mod receive;
 pub mod send;
+pub mod sync;
 pub mod vmx;
 
 pub use metadata::{SenderInfo, Tally};
