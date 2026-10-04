@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # libvmx needs clang (-fdeclspec) on Linux; ubuntu-latest ships it.
+      - name: Test
+        run: cargo test -p omt-rs --all-targets
+
+  # The official libomt, built from source, against omt-rs in both directions.
+  interop:
+    name: Interop vs libomt (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Build the official libomt (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: scripts/build-libomt.sh "$RUNNER_TEMP/libomt"
+      - name: Build the official libomt (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: scripts/build-libomt.ps1 -Out "$env:RUNNER_TEMP\libomt"
+      - name: Interop tests
+        shell: bash
+        run: OMT_LIB_DIR="$RUNNER_TEMP/libomt" cargo test -p omt-rs --features interop --test interop
+
+  # Mobile targets build (DrawLive ships omt-rs on Android and iOS).
+  android:
+    name: Build (Android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-ndk --locked
+      - name: Build
+        run: cargo ndk -t arm64-v8a -t armeabi-v7a build -p omt-rs
+
+  ios:
+    name: Build (iOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: |
+          cargo build -p omt-rs --target aarch64-apple-ios
+          cargo build -p omt-rs --target aarch64-apple-ios-sim
