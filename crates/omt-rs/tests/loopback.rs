@@ -234,23 +234,32 @@ fn a_stalled_receiver_never_blocks_the_sender() {
             ..Default::default()
         },
     );
-    let started = Instant::now();
+    // Keep sending until the stalled receiver's socket buffers and queue are
+    // full and frames start being dropped for it. However long that takes
+    // (loopback buffers can hold megabytes), no single send may block.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut dropped = 0;
-    for i in 0..300 {
-        let mut px = gradient();
+    let mut i = 0;
+    while dropped == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no frame was ever dropped for a receiver that never reads"
+        );
+        // Noise compresses badly, so the buffers fill quickly.
+        let mut px: Vec<u8> = (0..(W * H * 4) as u32)
+            .map(|v| (v.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        let started = Instant::now();
         dropped += tx
             .send_video(PixelFormat::Bgra, &mut px, W * 4, i)
             .unwrap()
             .dropped;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a send blocked on a stalled receiver"
+        );
+        i += 1;
     }
-    assert!(
-        dropped > 0,
-        "a receiver that never reads should have had frames dropped"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "sending blocked on a stalled receiver"
-    );
 }
 
 #[test]
