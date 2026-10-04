@@ -41,6 +41,16 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
+      # libomt discovers through Avahi on Linux and aborts the process when no
+      # daemon answers on the system bus. macOS (mDNSResponder) and Windows
+      # (DnsApi) run their discovery services out of the box.
+      - name: Start Avahi (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dbus avahi-daemon
+          sudo systemctl start dbus avahi-daemon
+          systemctl is-active dbus avahi-daemon
       - name: Build the official libomt (Linux/macOS)
         if: runner.os != 'Windows'
         run: bash scripts/build-libomt.sh "$RUNNER_TEMP/libomt"
