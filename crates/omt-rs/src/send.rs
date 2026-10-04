@@ -8,9 +8,10 @@
 //! therefore never stall the application's own loop - the property a live
 //! production tool needs most.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -18,7 +19,9 @@ use std::time::Duration;
 
 use crate::Error;
 use crate::discovery::Advertiser;
+use crate::metadata::{SenderInfo, Tally};
 use crate::protocol::{AudioHeader, FrameHeader, FrameType, VideoHeader, commands, video_flags};
+use crate::receive::metadata_frame;
 use crate::vmx::{VmxColorSpace, VmxInstance, VmxProfile};
 
 /// The port a sender listens on when its config asks for 0. A fixed default
@@ -87,6 +90,91 @@ pub struct SendOutcome {
     pub dropped: usize,
 }
 
+/// Running totals for a sender. Rates are left to the caller: sample twice
+/// and divide by the interval.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SenderStats {
+    /// Receiver connections (the reference libomt opens two per receiver).
+    pub connections: usize,
+    pub video_frames: u64,
+    pub audio_frames: u64,
+    /// Frames not handed to a subscribed receiver because it was behind,
+    /// summed over receivers.
+    pub video_dropped: u64,
+    pub audio_dropped: u64,
+    /// Bytes written to receivers' sockets.
+    pub bytes_sent: u64,
+}
+
+type TallyCallback = Box<dyn Fn(Tally) + Send + Sync>;
+
+/// State the sender shares with its per-receiver threads.
+#[derive(Default)]
+struct Shared {
+    clients: Mutex<Vec<Client>>,
+    /// `OMTInfo` XML sent to every receiver on connect.
+    sender_info: Mutex<Option<String>>,
+    /// Combined tally of all receivers, as last broadcast.
+    tally: Mutex<Tally>,
+    on_tally: Mutex<Option<TallyCallback>>,
+    video_frames: AtomicU64,
+    audio_frames: AtomicU64,
+    video_dropped: AtomicU64,
+    audio_dropped: AtomicU64,
+    bytes_sent: AtomicU64,
+}
+
+impl Shared {
+    /// Re-ORs every live receiver's tally; if the result changed, sends it to
+    /// all metadata-subscribed receivers (as libomt does) and tells the app.
+    fn update_tally(&self) {
+        let combined = {
+            let clients = self.clients.lock().unwrap();
+            clients
+                .iter()
+                .filter(|c| c.state.alive.load(Ordering::Relaxed))
+                .fold(Tally::NONE, |t, c| t.or(*c.state.tally.lock().unwrap()))
+        };
+        {
+            let mut last = self.tally.lock().unwrap();
+            if *last == combined {
+                return;
+            }
+            *last = combined;
+        }
+        self.send_metadata(combined.to_xml());
+        if let Some(cb) = self.on_tally.lock().unwrap().as_ref() {
+            cb(combined);
+        }
+    }
+
+    /// Queues `xml` for every receiver subscribed to metadata. Metadata never
+    /// competes with media for queue space, so it is never dropped.
+    fn send_metadata(&self, xml: &str) {
+        let frame = Arc::new(metadata_frame(xml));
+        for c in self.clients.lock().unwrap().iter() {
+            if c.state.metadata.load(Ordering::Relaxed) {
+                c.state.pending.lock().unwrap().push_back(frame.clone());
+            }
+        }
+    }
+}
+
+/// What a connection's reader thread learns, shared with the sender.
+#[derive(Default)]
+struct ClientState {
+    video: AtomicBool,
+    audio: AtomicBool,
+    metadata: AtomicBool,
+    /// This receiver's own program/preview tally.
+    tally: Mutex<Tally>,
+    /// Cleared when the connection's reader exits; a dead receiver's tally no
+    /// longer counts.
+    alive: AtomicBool,
+    /// Metadata waiting for the writer thread, ahead of queued media.
+    pending: Mutex<VecDeque<Arc<Vec<u8>>>>,
+}
+
 /// A connected receiver plus the frame types it subscribed to. Per the OMT
 /// spec a sender must not send a type until the receiver subscribes, and the
 /// reference libomt opens *separate* video-only and audio-only connections -
@@ -94,8 +182,7 @@ pub struct SendOutcome {
 /// ordering and starves the audio channel.
 struct Client {
     tx: SyncSender<Arc<Vec<u8>>>,
-    video: Arc<AtomicBool>,
-    audio: Arc<AtomicBool>,
+    state: Arc<ClientState>,
     /// Kept only to shut the socket down on eviction or teardown, which
     /// unblocks the client's reader and writer threads.
     stream: TcpStream,
@@ -106,7 +193,7 @@ pub struct Sender {
     /// a sender can exist before its video format is known.
     encoder: Option<VmxInstance>,
     encoded: Vec<u8>,
-    clients: Arc<Mutex<Vec<Client>>>,
+    shared: Arc<Shared>,
     config: SenderConfig,
     port: u16,
     _advertiser: Option<Advertiser>,
@@ -140,19 +227,19 @@ impl Sender {
             None
         };
 
-        let clients: Arc<Mutex<Vec<Client>>> = Arc::default();
+        let shared: Arc<Shared> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
         let accept_thread = {
-            let clients = clients.clone();
+            let shared = shared.clone();
             let stop = stop.clone();
             std::thread::Builder::new()
                 .name("omt-accept".into())
-                .spawn(move || accept_loop(listener, clients, stop))?
+                .spawn(move || accept_loop(listener, shared, stop))?
         };
         Ok(Self {
             encoder,
             encoded: Vec::new(),
-            clients,
+            shared,
             config,
             port,
             _advertiser: advertiser,
@@ -190,7 +277,42 @@ impl Sender {
     /// Currently connected receiver connections (the reference libomt opens
     /// two per receiver: one for video, one for audio).
     pub fn connections(&self) -> usize {
-        self.clients.lock().unwrap().len()
+        self.shared.clients.lock().unwrap().len()
+    }
+
+    /// Sets (or with `None` clears) what this sender says about itself.
+    /// Sent to receivers already connected and to every later one.
+    pub fn set_sender_info(&self, info: Option<&SenderInfo>) {
+        let xml = info.map(SenderInfo::to_xml);
+        if let Some(xml) = &xml {
+            self.shared.send_metadata(xml);
+        }
+        *self.shared.sender_info.lock().unwrap() = xml;
+    }
+
+    /// The combined tally of every connected receiver: on program if any
+    /// receiver has this source on program, likewise preview.
+    pub fn tally(&self) -> Tally {
+        *self.shared.tally.lock().unwrap()
+    }
+
+    /// Calls `f` with the combined tally whenever it changes. It runs on a
+    /// connection thread: keep it short and don't call back into the sender.
+    pub fn on_tally_changed(&self, f: impl Fn(Tally) + Send + Sync + 'static) {
+        *self.shared.on_tally.lock().unwrap() = Some(Box::new(f));
+    }
+
+    /// Running totals since the sender started.
+    pub fn statistics(&self) -> SenderStats {
+        let s = &self.shared;
+        SenderStats {
+            connections: self.connections(),
+            video_frames: s.video_frames.load(Ordering::Relaxed),
+            audio_frames: s.audio_frames.load(Ordering::Relaxed),
+            video_dropped: s.video_dropped.load(Ordering::Relaxed),
+            audio_dropped: s.audio_dropped.load(Ordering::Relaxed),
+            bytes_sent: s.bytes_sent.load(Ordering::Relaxed),
+        }
     }
 
     /// Encodes and sends one video frame. `pixels` must be exactly the
@@ -325,11 +447,11 @@ impl Sender {
 
     fn broadcast(&self, blob: Arc<Vec<u8>>, kind: FrameKind) -> SendOutcome {
         let mut outcome = SendOutcome::default();
-        let mut clients = self.clients.lock().unwrap();
+        let mut clients = self.shared.clients.lock().unwrap();
         clients.retain(|c| {
             let subscribed = match kind {
-                FrameKind::Video => &c.video,
-                FrameKind::Audio => &c.audio,
+                FrameKind::Video => &c.state.video,
+                FrameKind::Audio => &c.state.audio,
             };
             if !subscribed.load(Ordering::Relaxed) {
                 return true; // connected, not (yet) subscribed to this type
@@ -351,6 +473,13 @@ impl Sender {
                 }
             }
         });
+        drop(clients);
+        let (frames, dropped) = match kind {
+            FrameKind::Video => (&self.shared.video_frames, &self.shared.video_dropped),
+            FrameKind::Audio => (&self.shared.audio_frames, &self.shared.audio_dropped),
+        };
+        frames.fetch_add(1, Ordering::Relaxed);
+        dropped.fetch_add(outcome.dropped as u64, Ordering::Relaxed);
         outcome
     }
 }
@@ -358,7 +487,7 @@ impl Sender {
 impl Drop for Sender {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        for c in self.clients.lock().unwrap().iter() {
+        for c in self.shared.clients.lock().unwrap().iter() {
             let _ = c.stream.shutdown(Shutdown::Both);
         }
         if let Some(h) = self.accept_thread.take() {
@@ -373,12 +502,12 @@ enum FrameKind {
     Audio,
 }
 
-fn accept_loop(listener: TcpListener, clients: Arc<Mutex<Vec<Client>>>, stop: Arc<AtomicBool>) {
+fn accept_loop(listener: TcpListener, shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
-                if let Some(client) = start_client(stream) {
-                    clients.lock().unwrap().push(client);
+                if let Some(client) = start_client(stream, &shared) {
+                    shared.clients.lock().unwrap().push(client);
                 }
             }
             Err(_) => std::thread::sleep(Duration::from_millis(50)),
@@ -386,46 +515,82 @@ fn accept_loop(listener: TcpListener, clients: Arc<Mutex<Vec<Client>>>, stop: Ar
     }
 }
 
-fn start_client(stream: TcpStream) -> Option<Client> {
+fn start_client(stream: TcpStream, shared: &Arc<Shared>) -> Option<Client> {
     // Accepted sockets inherit the listener's non-blocking flag; OMT writes
     // are blocking (on the writer thread, never the caller's).
     stream.set_nonblocking(false).ok();
     stream.set_nodelay(true).ok();
     stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
-    let video = Arc::new(AtomicBool::new(false));
-    let audio = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(ClientState {
+        alive: AtomicBool::new(true),
+        ..Default::default()
+    });
+    // As libomt does on accept: sender info (if any) and the current combined
+    // tally go to every new connection, before it has subscribed to anything.
+    {
+        let mut pending = state.pending.lock().unwrap();
+        if let Some(info) = shared.sender_info.lock().unwrap().as_deref() {
+            pending.push_back(Arc::new(metadata_frame(info)));
+        }
+        let tally = *shared.tally.lock().unwrap();
+        pending.push_back(Arc::new(metadata_frame(tally.to_xml())));
+    }
     let rx_stream = stream.try_clone().ok()?;
-    let (rv, ra) = (video.clone(), audio.clone());
+    let (rx_state, rx_shared) = (state.clone(), shared.clone());
     std::thread::Builder::new()
         .name("omt-client-rx".into())
-        .spawn(move || read_subscribes(rx_stream, rv, ra))
+        .spawn(move || {
+            read_from_receiver(rx_stream, &rx_state, &rx_shared);
+            // Gone: its tally no longer counts.
+            rx_state.alive.store(false, Ordering::Relaxed);
+            rx_shared.update_tally();
+        })
         .ok()?;
     // Blocking writes are fine on this thread and keep each frame atomic on
-    // the wire; the caller drops frames when the queue is full.
+    // the wire; the caller drops media frames when the queue is full.
+    // Metadata goes through `pending`, checked between media frames.
     let (tx, rx) = sync_channel::<Arc<Vec<u8>>>(CLIENT_QUEUE);
     let mut wr = stream.try_clone().ok()?;
+    let (wr_state, wr_shared) = (state.clone(), shared.clone());
     std::thread::Builder::new()
         .name("omt-client-tx".into())
         .spawn(move || {
-            while let Ok(buf) = rx.recv() {
-                if wr.write_all(&buf).is_err() {
-                    break;
+            let mut write = |buf: &[u8]| -> bool {
+                if wr.write_all(buf).is_err() {
+                    return false;
+                }
+                wr_shared
+                    .bytes_sent
+                    .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                true
+            };
+            'outer: loop {
+                loop {
+                    let next = wr_state.pending.lock().unwrap().pop_front();
+                    let Some(buf) = next else { break };
+                    if !write(&buf) {
+                        break 'outer;
+                    }
+                }
+                match rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(buf) => {
+                        if !write(&buf) {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
             let _ = wr.shutdown(Shutdown::Both);
         })
         .ok()?;
-    Some(Client {
-        tx,
-        video,
-        audio,
-        stream,
-    })
+    Some(Client { tx, state, stream })
 }
 
-/// Reads frames a receiver sends and flips its subscription flags when the
-/// exact `OMTSubscribe` strings arrive. Exits on disconnect or teardown.
-fn read_subscribes(mut stream: TcpStream, video: Arc<AtomicBool>, audio: Arc<AtomicBool>) {
+/// Reads what a receiver sends: subscriptions (exact strings, as the OMT spec
+/// and libomt require) and tally. Exits on disconnect or teardown.
+fn read_from_receiver(mut stream: TcpStream, state: &ClientState, shared: &Shared) {
     let mut header = [0u8; FrameHeader::SIZE];
     loop {
         if stream.read_exact(&mut header).is_err() {
@@ -436,21 +601,28 @@ fn read_subscribes(mut stream: TcpStream, video: Arc<AtomicBool>, audio: Arc<Ato
         };
         let body_len = h.data_length.max(0) as usize;
         if body_len > 1 << 20 {
-            return; // a subscribe is tiny; anything this big is not OMT
+            return; // receivers send only small metadata; this is not OMT
         }
         let mut body = vec![0u8; body_len];
         if stream.read_exact(&mut body).is_err() {
             return;
         }
-        if h.frame_type == FrameType::Metadata {
-            // The reference sends raw UTF-8 with no null; tolerate one anyway.
-            let xml = std::str::from_utf8(&body)
-                .unwrap_or("")
-                .trim_end_matches('\0');
-            match xml {
-                commands::SUBSCRIBE_VIDEO => video.store(true, Ordering::Relaxed),
-                commands::SUBSCRIBE_AUDIO => audio.store(true, Ordering::Relaxed),
-                _ => {}
+        if h.frame_type != FrameType::Metadata {
+            continue;
+        }
+        // The reference sends raw UTF-8 with no null; tolerate one anyway.
+        let xml = std::str::from_utf8(&body)
+            .unwrap_or("")
+            .trim_end_matches('\0');
+        match xml {
+            commands::SUBSCRIBE_VIDEO => state.video.store(true, Ordering::Relaxed),
+            commands::SUBSCRIBE_AUDIO => state.audio.store(true, Ordering::Relaxed),
+            commands::SUBSCRIBE_METADATA => state.metadata.store(true, Ordering::Relaxed),
+            _ => {
+                if let Some(tally) = Tally::from_xml(xml) {
+                    *state.tally.lock().unwrap() = tally;
+                    shared.update_tally();
+                }
             }
         }
     }

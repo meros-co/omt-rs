@@ -176,16 +176,17 @@ fn each_connection_gets_only_what_it_subscribed_to() {
             .unwrap();
         tx.send_audio(48_000, 2, &planar, ts).unwrap();
         ts += 333_333;
-        if let Ok(f) = video_rx.next_frame() {
-            assert!(matches!(f, Frame::Video(_)), "video connection got {f:?}");
-            saw_video = true;
+        // Metadata (the tally a sender sends on connect) may arrive on
+        // either; media must only go where it was subscribed.
+        match video_rx.next_frame() {
+            Ok(Frame::Video(_)) => saw_video = true,
+            Ok(Frame::Audio(_)) => panic!("video connection got audio"),
+            _ => {}
         }
-        if let Ok(f) = audio_rx.next_frame() {
-            assert!(
-                matches!(f, Frame::Audio(_)),
-                "audio connection got a non-audio frame"
-            );
-            saw_audio = true;
+        match audio_rx.next_frame() {
+            Ok(Frame::Audio(_)) => saw_audio = true,
+            Ok(Frame::Video(_)) => panic!("audio connection got video"),
+            _ => {}
         }
     }
     assert!(

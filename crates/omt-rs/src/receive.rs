@@ -8,6 +8,7 @@
 use bytes::Bytes;
 
 use crate::Error;
+use crate::metadata::{SenderInfo, Tally};
 use crate::protocol::{AudioHeader, FrameHeader, FrameType, VideoHeader, commands};
 
 /// Sender-side quality to request ("Suggested Quality"). The sender lowers its
@@ -33,6 +34,10 @@ impl Quality {
 pub struct ReceiverOptions {
     pub video: bool,
     pub audio: bool,
+    /// Subscribe to the sender's metadata: the combined tally it broadcasts
+    /// when any receiver's tally changes, and any custom metadata. libomt's
+    /// receiver subscribes on one of its two connections.
+    pub metadata: bool,
     /// Ask the sender for this quality; `None` keeps the sender's default.
     pub quality: Option<Quality>,
 }
@@ -42,6 +47,7 @@ impl Default for ReceiverOptions {
         Self {
             video: true,
             audio: true,
+            metadata: false,
             quality: None,
         }
     }
@@ -96,6 +102,9 @@ const RESOLVE_TIMEOUT_MS: u64 = 3000;
 /// The metadata frames a receiver sends after connecting, in order.
 fn hello(options: &ReceiverOptions) -> Vec<Vec<u8>> {
     let mut xml = Vec::new();
+    if options.metadata {
+        xml.push(commands::SUBSCRIBE_METADATA.to_string());
+    }
     if options.video {
         xml.push(commands::SUBSCRIBE_VIDEO.to_string());
     }
@@ -185,12 +194,82 @@ fn body_len(header: &FrameHeader) -> Result<usize, Error> {
     Ok(len)
 }
 
+/// Running totals for a receiver connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReceiverStats {
+    pub video_frames: u64,
+    pub audio_frames: u64,
+    pub metadata_frames: u64,
+    /// Bytes read from the sender, headers included.
+    pub bytes_received: u64,
+}
+
+/// What a receiver has learned from the sender's metadata so far.
+#[derive(Default)]
+struct Learned {
+    stats: ReceiverStats,
+    sender_info: Option<SenderInfo>,
+    sender_tally: Tally,
+}
+
+impl Learned {
+    fn note(&mut self, header: &FrameHeader, frame: &Frame) {
+        self.stats.bytes_received +=
+            (FrameHeader::SIZE + header.data_length.max(0) as usize) as u64;
+        match frame {
+            Frame::Video(_) => self.stats.video_frames += 1,
+            Frame::Audio(_) => self.stats.audio_frames += 1,
+            Frame::Metadata { xml, .. } => {
+                self.stats.metadata_frames += 1;
+                if let Some(info) = SenderInfo::from_xml(xml) {
+                    self.sender_info = Some(info);
+                } else if let Some(tally) = Tally::from_xml(xml) {
+                    self.sender_tally = tally;
+                }
+            }
+        }
+    }
+}
+
 // ───────────────────────────── blocking ─────────────────────────────
+
+/// Sends metadata (tally, custom XML) on a [`BlockingReceiver`]'s connection
+/// from any thread, while another thread is blocked in `next_frame`.
+#[derive(Clone)]
+pub struct ReceiverControl {
+    stream: std::sync::Arc<std::sync::Mutex<std::net::TcpStream>>,
+}
+
+impl ReceiverControl {
+    /// Tells the sender whether this receiver has its source on program /
+    /// preview. The sender combines every receiver's tally.
+    pub fn send_tally(&self, tally: Tally) -> Result<(), Error> {
+        self.send_metadata(tally.to_xml())
+    }
+
+    pub fn send_metadata(&self, xml: &str) -> Result<(), Error> {
+        use std::io::Write;
+        let mut stream = self.stream.lock().unwrap();
+        stream.write_all(&metadata_frame(xml))?;
+        Ok(())
+    }
+
+    /// Unblocks a `next_frame` waiting on another thread (it returns
+    /// `Disconnected`).
+    pub fn shutdown(&self) {
+        let _ = self
+            .stream
+            .lock()
+            .unwrap()
+            .shutdown(std::net::Shutdown::Both);
+    }
+}
 
 /// Receiver on `std::net`.
 pub struct BlockingReceiver {
     stream: std::net::TcpStream,
     target: String,
+    learned: Learned,
 }
 
 impl BlockingReceiver {
@@ -213,7 +292,31 @@ impl BlockingReceiver {
         Ok(Self {
             stream,
             target: addr,
+            learned: Learned::default(),
         })
+    }
+
+    /// A handle for sending tally and metadata from other threads.
+    pub fn control(&self) -> Result<ReceiverControl, Error> {
+        Ok(ReceiverControl {
+            stream: std::sync::Arc::new(std::sync::Mutex::new(self.stream.try_clone()?)),
+        })
+    }
+
+    pub fn statistics(&self) -> ReceiverStats {
+        self.learned.stats
+    }
+
+    /// What the sender says about itself (its `OMTInfo`), once received.
+    /// libomt senders send it on connect when they have it set.
+    pub fn sender_info(&self) -> Option<&SenderInfo> {
+        self.learned.sender_info.as_ref()
+    }
+
+    /// The combined tally of all of the sender's receivers, as the sender
+    /// last reported it (needs `metadata: true` to see changes).
+    pub fn sender_tally(&self) -> Tally {
+        self.learned.sender_tally
     }
 
     /// The resolved `host:port`.
@@ -243,6 +346,7 @@ impl BlockingReceiver {
             let mut body = vec![0u8; body_len(&header)?];
             self.stream.read_exact(&mut body)?;
             if let Some(frame) = parse(&header, body)? {
+                self.learned.note(&header, &frame);
                 return Ok(frame);
             }
         }
@@ -268,6 +372,7 @@ impl BlockingReceiver {
 pub struct Receiver {
     stream: tokio::net::TcpStream,
     target: String,
+    learned: Learned,
 }
 
 #[cfg(feature = "tokio")]
@@ -294,11 +399,34 @@ impl Receiver {
         Ok(Self {
             stream,
             target: addr,
+            learned: Learned::default(),
         })
     }
 
     pub fn address(&self) -> &str {
         &self.target
+    }
+
+    /// Tells the sender whether this receiver has its source on program /
+    /// preview.
+    pub async fn send_tally(&mut self, tally: Tally) -> Result<(), Error> {
+        use tokio::io::AsyncWriteExt;
+        self.stream
+            .write_all(&metadata_frame(tally.to_xml()))
+            .await?;
+        Ok(())
+    }
+
+    pub fn statistics(&self) -> ReceiverStats {
+        self.learned.stats
+    }
+
+    pub fn sender_info(&self) -> Option<&SenderInfo> {
+        self.learned.sender_info.as_ref()
+    }
+
+    pub fn sender_tally(&self) -> Tally {
+        self.learned.sender_tally
     }
 
     /// The next frame. `Error::Disconnected` when the sender goes away.
@@ -313,6 +441,7 @@ impl Receiver {
             let mut body = vec![0u8; body_len(&header)?];
             self.stream.read_exact(&mut body).await?;
             if let Some(frame) = parse(&header, body)? {
+                self.learned.note(&header, &frame);
                 return Ok(frame);
             }
         }

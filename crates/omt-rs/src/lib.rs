@@ -5,6 +5,7 @@
 //!   a sender by name or address and read frames.
 //! * [`discovery`] - find senders on the LAN (mDNS `_omt._tcp`) and advertise.
 //! * [`vmx`] - the VMX video codec (vendored libvmx, MIT).
+//! * [`metadata`] - tally and sender information, as libomt writes them.
 //! * [`protocol`] - the wire format.
 //! * [`net`] - pin OMT to one network interface on a multi-homed machine.
 //!
@@ -15,16 +16,18 @@
 //! Timestamps are OMT ticks: 100 ns units ([`protocol::TICKS_PER_SECOND`]).
 
 pub mod discovery;
+pub mod metadata;
 pub mod net;
 pub mod protocol;
 pub mod receive;
 pub mod send;
 pub mod vmx;
 
+pub use metadata::{SenderInfo, Tally};
 #[cfg(feature = "tokio")]
 pub use receive::Receiver;
-pub use receive::{BlockingReceiver, Frame, ReceiverOptions};
-pub use send::{PixelFormat, SendOutcome, Sender, SenderConfig};
+pub use receive::{BlockingReceiver, Frame, ReceiverControl, ReceiverOptions, ReceiverStats};
+pub use send::{PixelFormat, SendOutcome, Sender, SenderConfig, SenderStats};
 
 /// Errors from sending, receiving and the codec.
 #[derive(Debug)]

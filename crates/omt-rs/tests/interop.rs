@@ -21,6 +21,7 @@ use libloading::{Library, Symbol};
 use omt::receive::{BlockingReceiver, Frame, ReceiverOptions};
 use omt::send::{PixelFormat, Sender, SenderConfig};
 use omt::vmx::{DecodeFormat, VmxDecoder};
+use omt::{SenderInfo, Tally};
 
 const W: i32 = 640;
 const H: i32 = 360;
@@ -56,6 +57,50 @@ struct MediaFrame {
     compressed_length: c_int,
     frame_metadata: *mut c_void,
     frame_metadata_length: c_int,
+}
+
+/// `OMTTally` from libomt.h.
+#[repr(C)]
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+struct RefTally {
+    preview: c_int,
+    program: c_int,
+}
+
+const MAX_STRING: usize = 1024;
+
+/// `OMTSenderInfo` from libomt.h.
+#[repr(C)]
+struct RefSenderInfo {
+    product_name: [c_char; MAX_STRING],
+    manufacturer: [c_char; MAX_STRING],
+    version: [c_char; MAX_STRING],
+    reserved: [[c_char; MAX_STRING]; 3],
+}
+
+impl RefSenderInfo {
+    fn zeroed() -> Box<Self> {
+        Box::new(unsafe { std::mem::zeroed() })
+    }
+
+    fn from(info: &SenderInfo) -> Box<Self> {
+        let mut r = Self::zeroed();
+        let put = |dst: &mut [c_char; MAX_STRING], s: &str| {
+            for (d, b) in dst.iter_mut().zip(s.bytes()) {
+                *d = b as c_char;
+            }
+        };
+        put(&mut r.product_name, &info.product_name);
+        put(&mut r.manufacturer, &info.manufacturer);
+        put(&mut r.version, &info.version);
+        r
+    }
+
+    fn get(field: &[c_char; MAX_STRING]) -> String {
+        unsafe { CStr::from_ptr(field.as_ptr()) }
+            .to_string_lossy()
+            .to_string()
+    }
 }
 
 impl Default for MediaFrame {
@@ -117,6 +162,8 @@ fn interop_with_the_official_libomt() {
     let lib = LibOmt::load();
     our_sender_to_their_receiver(&lib);
     their_sender_to_our_receiver(&lib);
+    tally_and_info_with_their_receiver(&lib);
+    tally_and_info_with_their_sender(&lib);
     let shutdown: Option<Symbol<unsafe extern "C" fn()>> =
         unsafe { lib.lib.get(b"omt_shutdown\0") }.ok();
     if let Some(shutdown) = shutdown {
@@ -336,4 +383,191 @@ fn their_port(source: &str, connections: impl Fn() -> c_int) -> u16 {
         }
     }
     panic!("libomt's listener not found in 6400-6600");
+}
+
+fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out: {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// omt-rs sends with sender info set; libomt receives. libomt's receiver
+/// reads the info, sets program tally, and hears the combined tally back.
+fn tally_and_info_with_their_receiver(lib: &LibOmt) {
+    let create: Symbol<unsafe extern "C" fn(*const c_char, c_int, c_int, c_int) -> *mut c_void> =
+        lib.sym(b"omt_receive_create\0");
+    let receive: Symbol<unsafe extern "C" fn(*mut c_void, c_int, c_int) -> *mut MediaFrame> =
+        lib.sym(b"omt_receive\0");
+    let set_tally: Symbol<unsafe extern "C" fn(*mut c_void, *mut RefTally)> =
+        lib.sym(b"omt_receive_settally\0");
+    let get_tally: Symbol<unsafe extern "C" fn(*mut c_void, c_int, *mut RefTally) -> c_int> =
+        lib.sym(b"omt_receive_gettally\0");
+    let get_info: Symbol<unsafe extern "C" fn(*mut c_void, *mut RefSenderInfo)> =
+        lib.sym(b"omt_receive_getsenderinformation\0");
+    let destroy: Symbol<unsafe extern "C" fn(*mut c_void)> = lib.sym(b"omt_receive_destroy\0");
+
+    let mut config = SenderConfig::new("omt-rs tally", W, H, (30, 1));
+    config.advertise = false;
+    let mut tx = Sender::new(config).expect("sender");
+    let info = SenderInfo {
+        product_name: "Helm".into(),
+        manufacturer: "Meros".into(),
+        version: "1.2.3".into(),
+    };
+    tx.set_sender_info(Some(&info));
+    let address = CString::new(format!("omt://127.0.0.1:{}", tx.port())).unwrap();
+    let rx = unsafe {
+        create(
+            address.as_ptr(),
+            FRAME_VIDEO | FRAME_AUDIO,
+            PREFERRED_BGRA,
+            0,
+        )
+    };
+    assert!(!rx.is_null());
+
+    // Keep frames flowing so libomt's connections come up and stay busy.
+    let src = gradient_bgra();
+    let mut ts = 0i64;
+    let mut pump = |tx: &mut Sender| {
+        let mut px = src.clone();
+        tx.send_video(PixelFormat::Bgra, &mut px, W * 4, ts)
+            .unwrap();
+        ts += 333_333;
+        unsafe { receive(rx, FRAME_VIDEO, 30) };
+    };
+
+    let mut got_info = RefSenderInfo::zeroed();
+    wait_until(
+        || {
+            pump(&mut tx);
+            unsafe { get_info(rx, &mut *got_info) };
+            RefSenderInfo::get(&got_info.product_name) == "Helm"
+        },
+        "libomt receiver reading omt-rs sender info",
+    );
+    assert_eq!(RefSenderInfo::get(&got_info.manufacturer), "Meros");
+    assert_eq!(RefSenderInfo::get(&got_info.version), "1.2.3");
+
+    let mut program = RefTally {
+        preview: 0,
+        program: 1,
+    };
+    unsafe { set_tally(rx, &mut program) };
+    wait_until(
+        || {
+            pump(&mut tx);
+            tx.tally()
+                == Tally {
+                    program: true,
+                    preview: false,
+                }
+        },
+        "omt-rs sender seeing libomt receiver's program tally",
+    );
+    let mut back = RefTally::default();
+    wait_until(
+        || {
+            pump(&mut tx);
+            unsafe { get_tally(rx, 10, &mut back) };
+            back == program
+        },
+        "libomt receiver hearing the combined tally back",
+    );
+
+    let mut none = RefTally::default();
+    unsafe { set_tally(rx, &mut none) };
+    wait_until(
+        || {
+            pump(&mut tx);
+            tx.tally() == Tally::NONE
+        },
+        "tally cleared",
+    );
+    unsafe { destroy(rx) };
+}
+
+/// libomt sends with sender info set; omt-rs receives the info and sends
+/// tally, which libomt's sender reports.
+fn tally_and_info_with_their_sender(lib: &LibOmt) {
+    let create: Symbol<unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void> =
+        lib.sym(b"omt_send_create\0");
+    let set_info: Symbol<unsafe extern "C" fn(*mut c_void, *mut RefSenderInfo)> =
+        lib.sym(b"omt_send_setsenderinformation\0");
+    let get_tally: Symbol<unsafe extern "C" fn(*mut c_void, c_int, *mut RefTally) -> c_int> =
+        lib.sym(b"omt_send_gettally\0");
+    let connections: Symbol<unsafe extern "C" fn(*mut c_void) -> c_int> =
+        lib.sym(b"omt_send_connections\0");
+    let destroy: Symbol<unsafe extern "C" fn(*mut c_void)> = lib.sym(b"omt_send_destroy\0");
+
+    let name = CString::new("omt-rs tally ref").unwrap();
+    let tx = unsafe { create(name.as_ptr(), QUALITY_DEFAULT) };
+    assert!(!tx.is_null());
+    let info = SenderInfo {
+        product_name: "vMix".into(),
+        manufacturer: "StudioCoast".into(),
+        version: "29".into(),
+    };
+    let mut ref_info = RefSenderInfo::from(&info);
+    unsafe { set_info(tx, &mut *ref_info) };
+    let port = their_port("omt-rs tally ref", || unsafe { connections(tx) });
+
+    let mut rx = BlockingReceiver::connect(
+        &format!("127.0.0.1:{port}"),
+        ReceiverOptions {
+            video: true,
+            audio: false,
+            metadata: true,
+            quality: None,
+        },
+    )
+    .expect("connect");
+    rx.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while rx.sender_info() != Some(&info) {
+        assert!(
+            Instant::now() < deadline,
+            "omt-rs never read libomt's sender info (got {:?})",
+            rx.sender_info()
+        );
+        let _ = rx.next_frame();
+    }
+
+    rx.control()
+        .unwrap()
+        .send_tally(Tally {
+            program: false,
+            preview: true,
+        })
+        .unwrap();
+    let mut t = RefTally::default();
+    wait_until(
+        || {
+            unsafe { get_tally(tx, 20, &mut t) };
+            t == RefTally {
+                preview: 1,
+                program: 0,
+            }
+        },
+        "libomt sender seeing omt-rs receiver's preview tally",
+    );
+    // And libomt broadcasts the combined tally, which omt-rs records.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while rx.sender_tally()
+        != (Tally {
+            program: false,
+            preview: true,
+        })
+    {
+        assert!(
+            Instant::now() < deadline,
+            "omt-rs never heard libomt's tally broadcast"
+        );
+        let _ = rx.next_frame();
+    }
+    drop(rx);
+    unsafe { destroy(tx) };
 }
