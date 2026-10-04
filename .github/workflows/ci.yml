@@ -79,3 +79,44 @@ jobs:
         run: |
           cargo build -p omt-rs --target aarch64-apple-ios
           cargo build -p omt-rs --target aarch64-apple-ios-sim
+
+  gstreamer:
+    name: GStreamer plugin (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GStreamer (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+      - name: Install GStreamer (macOS)
+        if: runner.os == 'macOS'
+        run: brew install gstreamer pkgconf
+      # The official MSVC installer with its development files.
+      - name: Install GStreamer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $v = "1.28.6"
+          $exe = "$env:RUNNER_TEMP\gstreamer.exe"
+          Invoke-WebRequest "https://gstreamer.freedesktop.org/data/pkg/windows/$v/msvc/gstreamer-1.0-msvc-x86_64-$v.exe" -OutFile $exe
+          Start-Process $exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/TYPE=full" -Wait
+          $root = "C:\Program Files\gstreamer\1.0\msvc_x86_64"
+          "$root\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          "PKG_CONFIG_PATH=$root\lib\pkgconfig" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "PKG_CONFIG=$root\bin\pkg-config.exe" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Test
+        run: cargo test -p gst-plugin-omt
+      - name: Build the plugin
+        run: cargo build -p gst-plugin-omt --release
+      - name: Inspect
+        shell: bash
+        run: GST_PLUGIN_PATH="$PWD/target/release" gst-inspect-1.0 omt

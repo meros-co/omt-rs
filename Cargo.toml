@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/omt-rs"]
+members = ["crates/omt-rs", "crates/gst-plugin-omt"]
+# The plugin needs GStreamer's development files; plain `cargo build` /
+# `cargo test` stays on the library. Use `-p gst-plugin-omt` (or --workspace).
+default-members = ["crates/omt-rs"]
 
 [workspace.package]
 edition = "2024"

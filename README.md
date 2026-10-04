@@ -8,6 +8,8 @@ iOS.
   is pure Rust; the VMX video codec is the official MIT-licensed libvmx,
   vendored and compiled by `build.rs`, so there is nothing to install and no
   .NET runtime.
+- **`gst-plugin-omt`** (`crates/gst-plugin-omt`) — GStreamer elements:
+  `omtsrc`, `omtsink` and an OMT device provider (see below).
 
 The crate is called `omt-rs` because `omt` and `libomt` on crates.io belong to
 other projects (`libomt` wraps the official .NET-based library, which has no
@@ -57,6 +59,39 @@ sources; `resolve` turns one into `host:port`. On a PC with several adapters
 (Hyper-V, WSL, Docker), `omt::net::set_preferred_interface` pins listening,
 advertising and browsing to one address.
 
+## GStreamer
+
+```sh
+cargo build -p gst-plugin-omt --release      # needs GStreamer's development files
+export GST_PLUGIN_PATH=$PWD/target/release   # gstomt.dll / libgstomt.so / .dylib
+gst-inspect-1.0 omt
+```
+
+| Element | |
+|---|---|
+| `omtsrc` | receives a source; request `video` and/or `audio` pads |
+| `omtsink` | publishes a source; request `video` and/or `audio` pads |
+| `omtvideosrc`, `omtaudiosrc` | the single-media sources `omtsrc` is built from |
+| `omtvideosink`, `omtaudiosink` | the single-media sinks `omtsink` is built from (same `omt-name` = one source) |
+| `omtdeviceprovider` | lists sources on the network through `GstDeviceMonitor` |
+
+```sh
+gst-launch-1.0 omtsrc source="STUDIO (Program)" name=s     s.video ! videoconvert ! autovideosink     s.audio ! audioconvert ! autoaudiosink
+
+gst-launch-1.0 videotestsrc is-live=true ! video/x-raw,format=UYVY ! s.video     audiotestsrc is-live=true ! audio/x-raw,format=F32LE,rate=48000 ! s.audio     omtsink name=s omt-name=Test
+```
+
+- `source` is a discovered name (`MACHINE (Name)`) or `host:port`.
+- Video comes out as UYVY, or BGRA with `alpha=true`; sinks take UYVY, BGRA
+  or BGRx. Audio is F32 (sinks take interleaved or non-interleaved).
+- `omtsink` properties: `omt-name`, `port` (0 = 6960 or any free port),
+  `quality` (`low`/`standard`/`high`, the VMX bitrate tier at the same
+  resolution) and `advertise`.
+- Timestamps: the sender's OMT timestamps are mapped onto running time with
+  one shared origin per `omtsrc`, so its video and audio stay in sync. There
+  is no drift correction between the sender's clock and the pipeline clock
+  yet.
+
 ## Compatibility with the official libomt
 
 Where the OMT spec text and the reference implementation disagree, omt-rs
@@ -80,7 +115,8 @@ in CI on all three desktop platforms.
 ## Tests
 
 ```sh
-cargo test                              # unit + sender-to-receiver over loopback
+cargo test                              # library: unit + sender-to-receiver over loopback
+cargo test -p gst-plugin-omt            # elements against each other
 OMT_TEST_MDNS=1 cargo test              # + real mDNS advertise/discover
 scripts/build-libomt.sh                 # (or .ps1 on Windows) build the reference
 OMT_LIB_DIR=target/libomt-ref cargo test --features interop --test interop
@@ -89,4 +125,5 @@ OMT_LIB_DIR=target/libomt-ref cargo test --features interop --test interop
 ## Licence
 
 MIT. The vendored libvmx and sse2neon are MIT too; ship
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) with binaries.
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) with binaries. The GStreamer
+plugin links GStreamer (LGPL) dynamically.

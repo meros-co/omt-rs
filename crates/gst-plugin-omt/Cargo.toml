@@ -1,0 +1,28 @@
+[package]
+name = "gst-plugin-omt"
+version = "0.1.0"
+description = "GStreamer elements for Open Media Transport (OMT): omtsrc, omtsink and a device provider"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+# The plugin file must be called gstomt so GStreamer registers it as "omt".
+name = "gstomt"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+gst = { package = "gstreamer", version = "0.25" }
+gst-base = { package = "gstreamer-base", version = "0.25" }
+gst-video = { package = "gstreamer-video", version = "0.25" }
+gst-audio = { package = "gstreamer-audio", version = "0.25", features = ["v1_16"] }
+omt = { package = "omt-rs", path = "../omt-rs", default-features = false }
+
+[dev-dependencies]
+gst-app = { package = "gstreamer-app", version = "0.25" }
+omt = { package = "omt-rs", path = "../omt-rs", default-features = false }
+
+[build-dependencies]
+gst-plugin-version-helper = "0.8"
