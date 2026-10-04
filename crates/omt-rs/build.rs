@@ -41,9 +41,18 @@ fn main() {
             core.define("ARM64", None).flag("-mfpu=neon");
         }
     } else {
-        core.file(src.join("vmxcodec_x86.cpp"))
+        core.file(src.join("vmxcodec_x86.cpp"));
+        if msvc {
             // Upstream's baseline: every x64 CPU since Sandy Bridge has AVX.
-            .flag(if msvc { "/arch:AVX" } else { "-mavx" });
+            // MSVC emits _lzcnt_u64 without needing a flag.
+            core.flag("/arch:AVX");
+        } else {
+            // vmxcodec_x86.cpp calls _lzcnt_u64, which GCC and clang only
+            // compile with the feature enabled (clang 18 rejects it outright;
+            // newer clang is lenient, which hid this). Upstream's own scripts
+            // pass -mlzcnt -mbmi for every unit.
+            core.flag("-mavx").flag("-mlzcnt").flag("-mbmi");
+        }
     }
     core.compile("vmx");
 
@@ -61,7 +70,9 @@ fn main() {
 
 fn base(msvc: bool, target_os: &str) -> cc::Build {
     let mut b = cc::Build::new();
-    b.cpp(true).std("c++17").opt_level(3);
+    // Vendored third-party code: its warnings are upstream's, and cc's
+    // default -Wall -Wextra buries real build errors under hundreds of them.
+    b.cpp(true).std("c++17").opt_level(3).warnings(false);
     if !msvc {
         b.flag("-fdeclspec");
         // GCC rejects -fdeclspec; use clang on Linux unless CXX is set
