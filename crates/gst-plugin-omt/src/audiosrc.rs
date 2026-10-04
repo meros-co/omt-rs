@@ -1,4 +1,6 @@
-//! `omtaudiosrc`: receives an OMT source's audio as interleaved F32.
+//! `omtaudiosrc`: receives an OMT source's audio as interleaved F32, resampled
+//! by the measured clock drift so it stays continuous on the corrected
+//! timeline it shares with the video.
 
 use gst::glib;
 use gst::prelude::*;
@@ -14,41 +16,42 @@ mod imp {
     use gst_base::subclass::prelude::*;
 
     use super::*;
-    use crate::shared::{CAT, TimeBase};
+    use crate::shared::{CAT, SourceShared, running_time_now};
+    use crate::srcprops::{self, SrcSettings};
     use omt::receive::{BlockingReceiver, Frame, ReceiverOptions};
+    use omt::sync::DriftResampler;
 
     struct Running {
         receiver: BlockingReceiver,
+        resampler: DriftResampler,
         caps_for: Option<(i32, i32)>,
     }
 
-    #[derive(Default)]
     pub struct OmtAudioSrc {
-        source: Mutex<String>,
+        settings: Mutex<SrcSettings>,
+        shared: Mutex<Arc<SourceShared>>,
         running: Mutex<Option<Running>>,
         flushing: AtomicBool,
-        time_base: Mutex<Option<Arc<TimeBase>>>,
+    }
+
+    impl Default for OmtAudioSrc {
+        fn default() -> Self {
+            Self {
+                settings: Mutex::default(),
+                shared: Mutex::new(SourceShared::new()),
+                running: Mutex::default(),
+                flushing: AtomicBool::new(false),
+            }
+        }
     }
 
     impl OmtAudioSrc {
-        pub fn set_time_base(&self, time_base: Arc<TimeBase>) {
-            *self.time_base.lock().unwrap() = Some(time_base);
+        pub fn set_shared(&self, shared: Arc<SourceShared>) {
+            *self.shared.lock().unwrap() = shared;
         }
 
-        fn time_base(&self) -> Arc<TimeBase> {
-            self.time_base
-                .lock()
-                .unwrap()
-                .get_or_insert_with(TimeBase::new)
-                .clone()
-        }
-
-        fn running_time_now(&self) -> gst::ClockTime {
-            let obj = self.obj();
-            match (obj.clock(), obj.base_time()) {
-                (Some(clock), Some(base)) => clock.time().saturating_sub(base),
-                _ => gst::ClockTime::ZERO,
-            }
+        fn shared(&self) -> Arc<SourceShared> {
+            self.shared.lock().unwrap().clone()
         }
     }
 
@@ -62,35 +65,21 @@ mod imp {
     impl ObjectImpl for OmtAudioSrc {
         fn properties() -> &'static [glib::ParamSpec] {
             static PROPS: std::sync::LazyLock<Vec<glib::ParamSpec>> =
-                std::sync::LazyLock::new(|| {
-                    vec![
-                        glib::ParamSpecString::builder("source")
-                            .nick("Source")
-                            .blurb(
-                                "OMT source: a discovered name (\"MACHINE (Name)\") or host:port",
-                            )
-                            .mutable_ready()
-                            .build(),
-                    ]
-                });
+                std::sync::LazyLock::new(|| srcprops::properties(false));
             PROPS.as_ref()
         }
 
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
-            match pspec.name() {
-                "source" => {
-                    *self.source.lock().unwrap() =
-                        value.get::<Option<String>>().unwrap().unwrap_or_default()
-                }
-                _ => unreachable!(),
-            }
+            srcprops::set(
+                &mut self.settings.lock().unwrap(),
+                &self.shared(),
+                value,
+                pspec,
+            );
         }
 
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
-            match pspec.name() {
-                "source" => self.source.lock().unwrap().to_value(),
-                _ => unreachable!(),
-            }
+            srcprops::get(&self.settings.lock().unwrap(), &self.shared(), pspec)
         }
 
         fn constructed(&self) {
@@ -120,16 +109,12 @@ mod imp {
         fn pad_templates() -> &'static [gst::PadTemplate] {
             static TEMPLATES: std::sync::LazyLock<Vec<gst::PadTemplate>> =
                 std::sync::LazyLock::new(|| {
-                    let caps = gst_audio::AudioCapsBuilder::new_interleaved()
-                        .format(gst_audio::AudioFormat::F32le)
-                        .channels_range(1..=32)
-                        .build();
                     vec![
                         gst::PadTemplate::new(
                             "src",
                             gst::PadDirection::Src,
                             gst::PadPresence::Always,
-                            &caps,
+                            &super::caps(),
                         )
                         .unwrap(),
                     ]
@@ -140,16 +125,19 @@ mod imp {
 
     impl BaseSrcImpl for OmtAudioSrc {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
-            let source = self.source.lock().unwrap().clone();
+            let source = self.settings.lock().unwrap().source.clone();
             if source.is_empty() {
                 return Err(gst::error_msg!(
                     gst::ResourceError::Settings,
                     ["no source set"]
                 ));
             }
+            // With no video sibling, this connection carries the metadata.
+            let shared = self.shared();
             let options = ReceiverOptions {
                 video: false,
                 audio: true,
+                metadata: true,
                 quality: None,
             };
             let receiver = BlockingReceiver::connect(&source, options).map_err(|e| {
@@ -168,9 +156,13 @@ mod imp {
                 source,
                 receiver.address()
             );
-            self.time_base().reset();
+            shared.claim_owner(self.obj().upcast_ref());
+            if let Ok(control) = receiver.control() {
+                shared.connected(control);
+            }
             *self.running.lock().unwrap() = Some(Running {
                 receiver,
+                resampler: DriftResampler::new(),
                 caps_for: None,
             });
             self.flushing.store(false, Ordering::SeqCst);
@@ -180,6 +172,7 @@ mod imp {
         fn stop(&self) -> Result<(), gst::ErrorMessage> {
             if let Some(r) = self.running.lock().unwrap().take() {
                 r.receiver.shutdown();
+                self.shared().disconnected();
             }
             Ok(())
         }
@@ -188,11 +181,17 @@ mod imp {
             false
         }
 
-        /// Caps come from the stream (set on the first frame and on every
-        /// format change). The default would fixate the template up front -
-        /// a 1x1 picture or 1 Hz audio - and force a renegotiation.
+        /// Caps come from the stream; see `omtvideosrc`.
         fn negotiate(&self) -> Result<(), gst::LoggableError> {
             Ok(())
+        }
+
+        fn query(&self, query: &mut gst::QueryRef) -> bool {
+            if let gst::QueryViewMut::Latency(_) = query.view_mut() {
+                let ms = self.settings.lock().unwrap().latency_ms;
+                return srcprops::latency_query(query, ms);
+            }
+            BaseSrcImplExt::parent_query(self, query)
         }
 
         fn unlock(&self) -> Result<(), gst::ErrorMessage> {
@@ -211,13 +210,16 @@ mod imp {
             &self,
             _buffer: Option<&mut gst::BufferRef>,
         ) -> Result<CreateSuccess, gst::FlowError> {
+            let shared = self.shared();
             let mut guard = self.running.lock().unwrap();
             let running = guard.as_mut().ok_or(gst::FlowError::Flushing)?;
             let audio = loop {
                 if self.flushing.load(Ordering::SeqCst) {
                     return Err(gst::FlowError::Flushing);
                 }
-                match running.receiver.next_frame() {
+                let frame = running.receiver.next_frame();
+                shared.learn(&running.receiver);
+                match frame {
                     Ok(Frame::Audio(a)) if a.header.samples_per_channel > 0 => break a,
                     Ok(_) => continue,
                     Err(omt::Error::Io(e))
@@ -238,8 +240,9 @@ mod imp {
                     }
                 }
             };
+            let arrival = running_time_now(self.obj().upcast_ref());
             let (rate, channels) = (audio.header.sample_rate, audio.header.channels.clamp(1, 32));
-            let spc = audio.header.samples_per_channel as usize;
+            shared.count_audio((audio.planar.len() * 4) as u64);
             if running.caps_for != Some((rate, channels)) {
                 let info = gst_audio::AudioInfo::builder(
                     gst_audio::AudioFormat::F32le,
@@ -256,31 +259,62 @@ mod imp {
                 guard = self.running.lock().unwrap();
                 guard.as_mut().ok_or(gst::FlowError::Flushing)?.caps_for = Some((rate, channels));
             }
-            drop(guard);
+            let running = guard.as_mut().ok_or(gst::FlowError::Flushing)?;
 
-            // OMT audio is planar; GStreamer's default layout is interleaved.
-            let ch = channels as usize;
-            let mut buffer =
-                gst::Buffer::with_size(spc * ch * 4).map_err(|_| gst::FlowError::Error)?;
+            let out = if shared
+                .drift_correction
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                // Resampled onto the shared, drift-corrected timeline.
+                let mut clock = shared.clock.lock().unwrap();
+                running.resampler.process(
+                    &mut clock,
+                    &audio.planar,
+                    rate,
+                    channels as usize,
+                    audio.timestamp,
+                    arrival.nseconds() as i64,
+                )
+            } else {
+                // Uncorrected: interleave as received, fixed-offset timestamps.
+                let ch = channels as usize;
+                let spc = audio.planar.len() / ch;
+                let mut interleaved = vec![0f32; spc * ch];
+                for i in 0..spc {
+                    for c in 0..ch {
+                        interleaved[i * ch + c] = audio.planar[c * spc + i];
+                    }
+                }
+                omt::sync::ResampledAudio {
+                    pts_ns: shared.running_time(audio.timestamp, arrival).nseconds() as i64,
+                    interleaved,
+                    frames: spc,
+                    discont: false,
+                }
+            };
+            drop(guard);
+            if out.frames == 0 {
+                // The resampler absorbed this buffer entirely; read the next.
+                return PushSrcImpl::create(self, None);
+            }
+
+            let mut buffer = gst::Buffer::with_size(out.interleaved.len() * 4)
+                .map_err(|_| gst::FlowError::Error)?;
             {
                 let buf = buffer.get_mut().unwrap();
                 {
                     let mut map = buf.map_writable().map_err(|_| gst::FlowError::Error)?;
-                    let out = map.as_mut_slice();
-                    for i in 0..spc {
-                        for c in 0..ch {
-                            let s = audio.planar.get(c * spc + i).copied().unwrap_or(0.0);
-                            out[(i * ch + c) * 4..][..4].copy_from_slice(&s.to_le_bytes());
-                        }
+                    for (dst, s) in map.as_mut_slice().chunks_exact_mut(4).zip(&out.interleaved) {
+                        dst.copy_from_slice(&s.to_le_bytes());
                     }
                 }
-                let pts = self
-                    .time_base()
-                    .running_time(audio.timestamp, self.running_time_now());
-                buf.set_pts(pts);
+                buf.set_pts(gst::ClockTime::from_nseconds(out.pts_ns.max(0) as u64));
                 buf.set_duration(
-                    gst::ClockTime::SECOND.mul_div_floor(spc as u64, rate.max(1) as u64),
+                    gst::ClockTime::SECOND.mul_div_floor(out.frames as u64, rate.max(1) as u64),
                 );
+                if out.discont {
+                    buf.set_flags(gst::BufferFlags::DISCONT);
+                }
             }
             Ok(CreateSuccess::NewBuffer(buffer))
         }
@@ -292,10 +326,17 @@ glib::wrapper! {
 }
 
 impl OmtAudioSrc {
-    pub(crate) fn set_time_base(&self, time_base: std::sync::Arc<crate::shared::TimeBase>) {
+    pub(crate) fn set_shared(&self, shared: std::sync::Arc<crate::shared::SourceShared>) {
         use gst::subclass::prelude::ObjectSubclassIsExt;
-        self.imp().set_time_base(time_base);
+        self.imp().set_shared(shared);
     }
+}
+
+pub(crate) fn caps() -> gst::Caps {
+    gst_audio::AudioCapsBuilder::new_interleaved()
+        .format(gst_audio::AudioFormat::F32le)
+        .channels_range(1..=32)
+        .build()
 }
 
 pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {

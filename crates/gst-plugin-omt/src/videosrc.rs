@@ -15,26 +15,10 @@ mod imp {
     use gst_video::VideoFormat;
 
     use super::*;
-    use crate::shared::{CAT, Quality, TimeBase};
+    use crate::shared::{CAT, SourceShared, running_time_now};
+    use crate::srcprops::{self, SrcSettings};
     use omt::receive::{BlockingReceiver, Frame, ReceiverOptions};
     use omt::vmx::{DecodeFormat, VmxDecoder};
-
-    #[derive(Clone)]
-    struct Settings {
-        source: String,
-        quality: Quality,
-        alpha: bool,
-    }
-
-    impl Default for Settings {
-        fn default() -> Self {
-            Self {
-                source: String::new(),
-                quality: Quality::Standard,
-                alpha: false,
-            }
-        }
-    }
 
     struct Running {
         receiver: BlockingReceiver,
@@ -43,34 +27,32 @@ mod imp {
         caps_for: Option<(i32, i32, i32, i32, VideoFormat)>,
     }
 
-    #[derive(Default)]
     pub struct OmtVideoSrc {
-        settings: Mutex<Settings>,
+        settings: Mutex<SrcSettings>,
+        shared: Mutex<Arc<SourceShared>>,
         running: Mutex<Option<Running>>,
         flushing: AtomicBool,
-        time_base: Mutex<Option<Arc<TimeBase>>>,
+    }
+
+    impl Default for OmtVideoSrc {
+        fn default() -> Self {
+            Self {
+                settings: Mutex::default(),
+                shared: Mutex::new(SourceShared::new()),
+                running: Mutex::default(),
+                flushing: AtomicBool::new(false),
+            }
+        }
     }
 
     impl OmtVideoSrc {
-        /// Shares a time base with a sibling audio source (set by `omtsrc`).
-        pub fn set_time_base(&self, time_base: Arc<TimeBase>) {
-            *self.time_base.lock().unwrap() = Some(time_base);
+        /// Shares state with a sibling audio source (set by `omtsrc`).
+        pub fn set_shared(&self, shared: Arc<SourceShared>) {
+            *self.shared.lock().unwrap() = shared;
         }
 
-        fn time_base(&self) -> Arc<TimeBase> {
-            self.time_base
-                .lock()
-                .unwrap()
-                .get_or_insert_with(TimeBase::new)
-                .clone()
-        }
-
-        fn running_time_now(&self) -> gst::ClockTime {
-            let obj = self.obj();
-            match (obj.clock(), obj.base_time()) {
-                (Some(clock), Some(base)) => clock.time().saturating_sub(base),
-                _ => gst::ClockTime::ZERO,
-            }
+        fn shared(&self) -> Arc<SourceShared> {
+            self.shared.lock().unwrap().clone()
         }
     }
 
@@ -84,50 +66,21 @@ mod imp {
     impl ObjectImpl for OmtVideoSrc {
         fn properties() -> &'static [glib::ParamSpec] {
             static PROPS: std::sync::LazyLock<Vec<glib::ParamSpec>> =
-                std::sync::LazyLock::new(|| {
-                    vec![
-                        glib::ParamSpecString::builder("source")
-                            .nick("Source")
-                            .blurb(
-                                "OMT source: a discovered name (\"MACHINE (Name)\") or host:port",
-                            )
-                            .mutable_ready()
-                            .build(),
-                        glib::ParamSpecEnum::builder_with_default("quality", Quality::Standard)
-                            .nick("Quality")
-                            .blurb("Quality to ask the sender for (standard = sender's choice)")
-                            .mutable_ready()
-                            .build(),
-                        glib::ParamSpecBoolean::builder("alpha")
-                            .nick("Alpha")
-                            .blurb(
-                                "Output BGRA, keeping the sender's alpha channel, instead of UYVY",
-                            )
-                            .mutable_ready()
-                            .build(),
-                    ]
-                });
+                std::sync::LazyLock::new(|| srcprops::properties(true));
             PROPS.as_ref()
         }
 
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
-            let mut s = self.settings.lock().unwrap();
-            match pspec.name() {
-                "source" => s.source = value.get::<Option<String>>().unwrap().unwrap_or_default(),
-                "quality" => s.quality = value.get().unwrap(),
-                "alpha" => s.alpha = value.get().unwrap(),
-                _ => unreachable!(),
-            }
+            srcprops::set(
+                &mut self.settings.lock().unwrap(),
+                &self.shared(),
+                value,
+                pspec,
+            );
         }
 
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
-            let s = self.settings.lock().unwrap();
-            match pspec.name() {
-                "source" => s.source.to_value(),
-                "quality" => s.quality.to_value(),
-                "alpha" => s.alpha.to_value(),
-                _ => unreachable!(),
-            }
+            srcprops::get(&self.settings.lock().unwrap(), &self.shared(), pspec)
         }
 
         fn constructed(&self) {
@@ -157,15 +110,12 @@ mod imp {
         fn pad_templates() -> &'static [gst::PadTemplate] {
             static TEMPLATES: std::sync::LazyLock<Vec<gst::PadTemplate>> =
                 std::sync::LazyLock::new(|| {
-                    let caps = gst_video::VideoCapsBuilder::new()
-                        .format_list([VideoFormat::Uyvy, VideoFormat::Bgra])
-                        .build();
                     vec![
                         gst::PadTemplate::new(
                             "src",
                             gst::PadDirection::Src,
                             gst::PadPresence::Always,
-                            &caps,
+                            &super::caps(),
                         )
                         .unwrap(),
                     ]
@@ -183,9 +133,12 @@ mod imp {
                     ["no source set"]
                 ));
             }
+            // Metadata (tally broadcasts, sender info changes) on the video
+            // connection, as libomt's receiver does.
             let options = ReceiverOptions {
                 video: true,
                 audio: false,
+                metadata: true,
                 quality: s.quality.request(),
             };
             let receiver = BlockingReceiver::connect(&s.source, options).map_err(|e| {
@@ -205,7 +158,11 @@ mod imp {
                 s.source,
                 receiver.address()
             );
-            self.time_base().reset();
+            let shared = self.shared();
+            shared.claim_owner(self.obj().upcast_ref());
+            if let Ok(control) = receiver.control() {
+                shared.connected(control);
+            }
             *self.running.lock().unwrap() = Some(Running {
                 receiver,
                 decoder: VmxDecoder::new(),
@@ -218,6 +175,7 @@ mod imp {
         fn stop(&self) -> Result<(), gst::ErrorMessage> {
             if let Some(r) = self.running.lock().unwrap().take() {
                 r.receiver.shutdown();
+                self.shared().disconnected();
             }
             Ok(())
         }
@@ -228,9 +186,17 @@ mod imp {
 
         /// Caps come from the stream (set on the first frame and on every
         /// format change). The default would fixate the template up front -
-        /// a 1x1 picture or 1 Hz audio - and force a renegotiation.
+        /// a 1x1 picture - and force a renegotiation.
         fn negotiate(&self) -> Result<(), gst::LoggableError> {
             Ok(())
+        }
+
+        fn query(&self, query: &mut gst::QueryRef) -> bool {
+            if let gst::QueryViewMut::Latency(_) = query.view_mut() {
+                let ms = self.settings.lock().unwrap().latency_ms;
+                return srcprops::latency_query(query, ms);
+            }
+            BaseSrcImplExt::parent_query(self, query)
         }
 
         fn unlock(&self) -> Result<(), gst::ErrorMessage> {
@@ -255,13 +221,16 @@ mod imp {
             } else {
                 (VideoFormat::Uyvy, DecodeFormat::Uyvy)
             };
+            let shared = self.shared();
             let mut guard = self.running.lock().unwrap();
             let running = guard.as_mut().ok_or(gst::FlowError::Flushing)?;
             let video = loop {
                 if self.flushing.load(Ordering::SeqCst) {
                     return Err(gst::FlowError::Flushing);
                 }
-                match running.receiver.next_frame() {
+                let frame = running.receiver.next_frame();
+                shared.learn(&running.receiver);
+                match frame {
                     Ok(Frame::Video(v)) => break v,
                     Ok(_) => continue,
                     Err(omt::Error::Io(e))
@@ -290,13 +259,22 @@ mod imp {
                     }
                 }
             };
+            let arrival = running_time_now(self.obj().upcast_ref());
 
             let h = &video.header;
             let (w, ht) = (h.width, h.height);
-            let key = (w, ht, h.frame_rate_n, h.frame_rate_d.max(1), format);
+            let (fps_n, fps_d) = (h.frame_rate_n, h.frame_rate_d.max(1));
+            let frame_ticks = if fps_n > 0 {
+                omt::protocol::TICKS_PER_SECOND * fps_d as i64 / fps_n as i64
+            } else {
+                0
+            };
+            shared.count_video(video.timestamp, frame_ticks, video.data.len() as u64);
+
+            let key = (w, ht, fps_n, fps_d, format);
             if running.caps_for != Some(key) {
                 let info = gst_video::VideoInfo::builder(format, w as u32, ht as u32)
-                    .fps(gst::Fraction::new(h.frame_rate_n, h.frame_rate_d.max(1)))
+                    .fps(gst::Fraction::new(fps_n, fps_d))
                     .build()
                     .map_err(|_| gst::FlowError::NotNegotiated)?;
                 let caps = info.to_caps().map_err(|_| gst::FlowError::NotNegotiated)?;
@@ -330,16 +308,13 @@ mod imp {
                     })?;
             }
             drop(guard);
-            let pts = self
-                .time_base()
-                .running_time(video.timestamp, self.running_time_now());
+            let pts = shared.running_time(video.timestamp, arrival);
             {
                 let buf = buffer.get_mut().unwrap();
                 buf.set_pts(pts);
-                if h.frame_rate_n > 0 {
+                if fps_n > 0 {
                     buf.set_duration(
-                        gst::ClockTime::SECOND
-                            .mul_div_floor(h.frame_rate_d.max(1) as u64, h.frame_rate_n as u64),
+                        gst::ClockTime::SECOND.mul_div_floor(fps_d as u64, fps_n as u64),
                     );
                 }
             }
@@ -353,10 +328,16 @@ glib::wrapper! {
 }
 
 impl OmtVideoSrc {
-    pub(crate) fn set_time_base(&self, time_base: std::sync::Arc<crate::shared::TimeBase>) {
+    pub(crate) fn set_shared(&self, shared: std::sync::Arc<crate::shared::SourceShared>) {
         use gst::subclass::prelude::ObjectSubclassIsExt;
-        self.imp().set_time_base(time_base);
+        self.imp().set_shared(shared);
     }
+}
+
+pub(crate) fn caps() -> gst::Caps {
+    gst_video::VideoCapsBuilder::new()
+        .format_list([gst_video::VideoFormat::Uyvy, gst_video::VideoFormat::Bgra])
+        .build()
 }
 
 pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {

@@ -1,6 +1,7 @@
 //! `omtsink`: one OMT source carrying video and/or audio. Request a `video`
 //! pad, an `audio` pad, or both; each is backed by an `omtvideosink` /
-//! `omtaudiosink` sharing one sender.
+//! `omtaudiosink` sharing one sender (and so one tally, sender info and set
+//! of statistics).
 
 use gst::glib;
 use gst::prelude::*;
@@ -12,7 +13,7 @@ mod imp {
 
     use super::*;
     use crate::shared::CAT;
-    use crate::videosink::{SinkSettings, set_sink_property, sink_properties, sink_property};
+    use crate::sinkprops::{self, SinkSettings};
 
     #[derive(Default)]
     pub struct OmtSink {
@@ -29,16 +30,16 @@ mod imp {
     impl ObjectImpl for OmtSink {
         fn properties() -> &'static [glib::ParamSpec] {
             static PROPS: std::sync::LazyLock<Vec<glib::ParamSpec>> =
-                std::sync::LazyLock::new(sink_properties);
+                std::sync::LazyLock::new(sinkprops::properties);
             PROPS.as_ref()
         }
 
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
-            set_sink_property(&mut self.settings.lock().unwrap(), value, pspec);
+            sinkprops::set(&mut self.settings.lock().unwrap(), value, pspec);
         }
 
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
-            sink_property(&self.settings.lock().unwrap(), pspec)
+            sinkprops::get(&self.settings.lock().unwrap(), pspec)
         }
     }
 
@@ -61,19 +62,21 @@ mod imp {
         fn pad_templates() -> &'static [gst::PadTemplate] {
             static TEMPLATES: std::sync::LazyLock<Vec<gst::PadTemplate>> =
                 std::sync::LazyLock::new(|| {
-                    let template = |name: &str, factory: &str| {
-                        let caps = child_template_caps(factory);
+                    vec![
                         gst::PadTemplate::new(
-                            name,
+                            "video",
                             gst::PadDirection::Sink,
                             gst::PadPresence::Request,
-                            &caps,
+                            &crate::videosink::caps(),
                         )
-                        .unwrap()
-                    };
-                    vec![
-                        template("video", "omtvideosink"),
-                        template("audio", "omtaudiosink"),
+                        .unwrap(),
+                        gst::PadTemplate::new(
+                            "audio",
+                            gst::PadDirection::Sink,
+                            gst::PadPresence::Request,
+                            &crate::audiosink::caps(),
+                        )
+                        .unwrap(),
                     ]
                 });
             TEMPLATES.as_ref()
@@ -102,6 +105,10 @@ mod imp {
                 .property("port", s.port)
                 .property("quality", s.quality)
                 .property("advertise", s.advertise)
+                .property("product-name", &s.info.product_name)
+                .property("manufacturer", &s.info.manufacturer)
+                .property("version", &s.info.version)
+                .property("stats-interval", s.stats_interval)
                 .build()
                 .ok()?;
             obj.add(&child).ok()?;
@@ -129,20 +136,7 @@ mod imp {
     }
 
     impl BinImpl for OmtSink {}
-
-    pub(crate) fn child_template_caps(factory: &str) -> gst::Caps {
-        gst::ElementFactory::find(factory)
-            .and_then(|f| {
-                f.static_pad_templates()
-                    .into_iter()
-                    .next()
-                    .map(|t| t.caps())
-            })
-            .unwrap_or_else(gst::Caps::new_any)
-    }
 }
-
-pub(crate) use imp::child_template_caps;
 
 glib::wrapper! {
     pub struct OmtSink(ObjectSubclass<imp::OmtSink>) @extends gst::Bin, gst::Element, gst::Object, @implements gst::ChildProxy;

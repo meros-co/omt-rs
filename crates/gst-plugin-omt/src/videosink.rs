@@ -3,47 +3,29 @@
 use gst::glib;
 use gst::prelude::*;
 use gst_base::prelude::*;
-use gst_video::prelude::*;
 
 mod imp {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use gst::subclass::prelude::*;
     use gst_base::subclass::prelude::*;
     use gst_video::VideoFormat;
+    use gst_video::prelude::*;
 
     use super::*;
-    use crate::shared::{self, CAT, Quality, SharedSender};
+    use crate::shared::{CAT, SinkShared};
+    use crate::sinkprops::{self, SinkSettings, running_ticks};
     use omt::PixelFormat;
 
-    #[derive(Clone)]
-    pub(crate) struct Settings {
-        pub omt_name: String,
-        pub port: u32,
-        pub quality: Quality,
-        pub advertise: bool,
-    }
-
-    impl Default for Settings {
-        fn default() -> Self {
-            Self {
-                omt_name: "GStreamer".into(),
-                port: 0,
-                quality: Quality::Standard,
-                advertise: true,
-            }
-        }
-    }
-
     struct State {
-        sender: SharedSender,
+        shared: Arc<SinkShared>,
         info: Option<gst_video::VideoInfo>,
         scratch: Vec<u8>,
     }
 
     #[derive(Default)]
     pub struct OmtVideoSink {
-        settings: Mutex<Settings>,
+        settings: Mutex<SinkSettings>,
         state: Mutex<Option<State>>,
     }
 
@@ -54,73 +36,19 @@ mod imp {
         type ParentType = gst_base::BaseSink;
     }
 
-    pub(crate) fn sink_properties() -> Vec<glib::ParamSpec> {
-        vec![
-            glib::ParamSpecString::builder("omt-name")
-                .nick("OMT name")
-                .blurb("Source name to publish; receivers see \"MACHINE (omt-name)\"")
-                .default_value(Some("GStreamer"))
-                .mutable_ready()
-                .build(),
-            glib::ParamSpecUInt::builder("port")
-                .nick("Port")
-                .blurb("TCP port to listen on (0 = 6960, or any free port if taken)")
-                .maximum(65535)
-                .mutable_ready()
-                .build(),
-            glib::ParamSpecEnum::builder_with_default("quality", Quality::Standard)
-                .nick("Quality")
-                .blurb("VMX quality tier (bitrate); never changes the resolution")
-                .mutable_ready()
-                .build(),
-            glib::ParamSpecBoolean::builder("advertise")
-                .nick("Advertise")
-                .blurb("Publish the source over mDNS so receivers can find it by name")
-                .default_value(true)
-                .mutable_ready()
-                .build(),
-        ]
-    }
-
-    pub(crate) fn set_sink_property(
-        settings: &mut Settings,
-        value: &glib::Value,
-        pspec: &glib::ParamSpec,
-    ) {
-        match pspec.name() {
-            "omt-name" => {
-                settings.omt_name = value.get::<Option<String>>().unwrap().unwrap_or_default()
-            }
-            "port" => settings.port = value.get().unwrap(),
-            "quality" => settings.quality = value.get().unwrap(),
-            "advertise" => settings.advertise = value.get().unwrap(),
-            _ => unreachable!(),
-        }
-    }
-
-    pub(crate) fn sink_property(settings: &Settings, pspec: &glib::ParamSpec) -> glib::Value {
-        match pspec.name() {
-            "omt-name" => settings.omt_name.to_value(),
-            "port" => settings.port.to_value(),
-            "quality" => settings.quality.to_value(),
-            "advertise" => settings.advertise.to_value(),
-            _ => unreachable!(),
-        }
-    }
-
     impl ObjectImpl for OmtVideoSink {
         fn properties() -> &'static [glib::ParamSpec] {
             static PROPS: std::sync::LazyLock<Vec<glib::ParamSpec>> =
-                std::sync::LazyLock::new(sink_properties);
+                std::sync::LazyLock::new(sinkprops::properties);
             PROPS.as_ref()
         }
 
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
-            set_sink_property(&mut self.settings.lock().unwrap(), value, pspec);
+            sinkprops::set(&mut self.settings.lock().unwrap(), value, pspec);
         }
 
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
-            sink_property(&self.settings.lock().unwrap(), pspec)
+            sinkprops::get(&self.settings.lock().unwrap(), pspec)
         }
 
         fn constructed(&self) {
@@ -150,15 +78,12 @@ mod imp {
         fn pad_templates() -> &'static [gst::PadTemplate] {
             static TEMPLATES: std::sync::LazyLock<Vec<gst::PadTemplate>> =
                 std::sync::LazyLock::new(|| {
-                    let caps = gst_video::VideoCapsBuilder::new()
-                        .format_list([VideoFormat::Uyvy, VideoFormat::Bgra, VideoFormat::Bgrx])
-                        .build();
                     vec![
                         gst::PadTemplate::new(
                             "sink",
                             gst::PadDirection::Sink,
                             gst::PadPresence::Always,
-                            &caps,
+                            &super::caps(),
                         )
                         .unwrap(),
                     ]
@@ -169,23 +94,17 @@ mod imp {
 
     impl BaseSinkImpl for OmtVideoSink {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
-            let s = self.settings.lock().unwrap().clone();
-            let sender = shared::sender(&s.omt_name, s.port as u16, s.quality, s.advertise)
-                .map_err(|e| {
-                    gst::error_msg!(
-                        gst::ResourceError::OpenWrite,
-                        ["could not start OMT sender {}: {}", s.omt_name, e]
-                    )
-                })?;
+            let settings = self.settings.lock().unwrap().clone();
+            let shared = settings.start(self.obj().upcast_ref())?;
             gst::info!(
                 CAT,
                 imp = self,
                 "publishing {} on port {}",
-                s.omt_name,
-                sender.lock().unwrap().port()
+                settings.omt_name,
+                shared.sender.lock().unwrap().port()
             );
             *self.state.lock().unwrap() = Some(State {
-                sender,
+                shared,
                 info: None,
                 scratch: Vec::new(),
             });
@@ -205,7 +124,7 @@ mod imp {
                 .as_mut()
                 .ok_or_else(|| gst::loggable_error!(CAT, "not started"))?;
             let fps = info.fps();
-            state.sender.lock().unwrap().set_video_format(
+            state.shared.sender.lock().unwrap().set_video_format(
                 info.width() as i32,
                 info.height() as i32,
                 (fps.numer().max(1), fps.denom().max(1)),
@@ -231,6 +150,7 @@ mod imp {
             state.scratch.extend_from_slice(data);
             let ts = running_ticks(&*self.obj(), buffer);
             let outcome = state
+                .shared
                 .sender
                 .lock()
                 .unwrap()
@@ -250,30 +170,21 @@ mod imp {
             Ok(gst::FlowSuccess::Ok)
         }
     }
-
-    /// A buffer's running time in OMT ticks (100 ns), shared by video and
-    /// audio so receivers can sync them.
-    pub(crate) fn running_ticks(
-        sink: &impl IsA<gst_base::BaseSink>,
-        buffer: &gst::BufferRef,
-    ) -> i64 {
-        let segment = sink.as_ref().segment();
-        let rt = buffer.pts().and_then(|pts| {
-            segment
-                .downcast_ref::<gst::ClockTime>()
-                .and_then(|s| s.to_running_time(pts))
-        });
-        rt.map(|t| (t.nseconds() / 100) as i64).unwrap_or(-1).max(0)
-    }
 }
 
 glib::wrapper! {
     pub struct OmtVideoSink(ObjectSubclass<imp::OmtVideoSink>) @extends gst_base::BaseSink, gst::Element, gst::Object;
 }
 
-pub(crate) use imp::{
-    Settings as SinkSettings, running_ticks, set_sink_property, sink_properties, sink_property,
-};
+pub(crate) fn caps() -> gst::Caps {
+    gst_video::VideoCapsBuilder::new()
+        .format_list([
+            gst_video::VideoFormat::Uyvy,
+            gst_video::VideoFormat::Bgra,
+            gst_video::VideoFormat::Bgrx,
+        ])
+        .build()
+}
 
 pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     gst::Element::register(

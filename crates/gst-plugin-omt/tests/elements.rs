@@ -206,17 +206,28 @@ fn device_provider_lists_an_advertised_sink() {
     init();
     omt::discovery::set_machine_name("GSTTEST");
     let sender = pipeline(
-        "videotestsrc is-live=true ! video/x-raw,format=UYVY,width=320,height=180 ! omtvideosink omt-name=DeviceCheck port=9792",
+        "videotestsrc is-live=true ! video/x-raw,format=UYVY,width=320,height=180 !          omtvideosink omt-name=DeviceCheck port=9792 product-name=CheckProduct manufacturer=Meros",
     );
     sender.set_state(gst::State::Playing).unwrap();
     std::thread::sleep(Duration::from_secs(1));
     let provider = gst::DeviceProviderFactory::by_name("omtdeviceprovider").expect("provider");
-    let found = (0..3).any(|_| {
+    let device = (0..3).find_map(|_| {
         provider
             .devices()
-            .iter()
-            .any(|d| d.display_name() == "GSTTEST (DeviceCheck)")
+            .into_iter()
+            .find(|d| d.display_name() == "GSTTEST (DeviceCheck)")
     });
     sender.set_state(gst::State::Null).unwrap();
-    assert!(found, "omtdeviceprovider did not list the sink");
+    let device = device.expect("omtdeviceprovider did not list the sink");
+    // The device carries the source's own sender info.
+    let props = device.properties().expect("device properties");
+    assert_eq!(
+        props.get::<&str>("omt.source").unwrap(),
+        "GSTTEST (DeviceCheck)"
+    );
+    assert_eq!(
+        props.get::<&str>("omt.product-name").unwrap(),
+        "CheckProduct"
+    );
+    assert_eq!(props.get::<&str>("omt.manufacturer").unwrap(), "Meros");
 }

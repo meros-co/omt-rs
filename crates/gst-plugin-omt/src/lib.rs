@@ -12,7 +12,9 @@
 //!
 //! OMT receivers already use one connection per media type, so the video and
 //! audio elements each run their own; the bins put them back together, with
-//! one shared time base so audio and video stay in sync.
+//! one shared, drift-corrected timeline so audio and video stay in sync, and
+//! one set of tally, sender info and statistics (see `shared` for the bus
+//! messages).
 //!
 //! ```text
 //! gst-launch-1.0 omtsrc source="STUDIO (Program)" name=s \
@@ -28,7 +30,9 @@ mod audiosrc;
 mod deviceprovider;
 mod shared;
 mod sinkbin;
+mod sinkprops;
 mod srcbin;
+mod srcprops;
 mod videosink;
 mod videosrc;
 

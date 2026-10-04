@@ -6,19 +6,17 @@ use gst::prelude::*;
 use gst_base::prelude::*;
 
 mod imp {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use gst::subclass::prelude::*;
     use gst_base::subclass::prelude::*;
 
     use super::*;
-    use crate::shared::{self, CAT, SharedSender};
-    use crate::videosink::{
-        SinkSettings, running_ticks, set_sink_property, sink_properties, sink_property,
-    };
+    use crate::shared::{CAT, SinkShared};
+    use crate::sinkprops::{self, SinkSettings, running_ticks};
 
     struct State {
-        sender: SharedSender,
+        shared: Arc<SinkShared>,
         info: Option<gst_audio::AudioInfo>,
         planar: Vec<f32>,
     }
@@ -39,16 +37,16 @@ mod imp {
     impl ObjectImpl for OmtAudioSink {
         fn properties() -> &'static [glib::ParamSpec] {
             static PROPS: std::sync::LazyLock<Vec<glib::ParamSpec>> =
-                std::sync::LazyLock::new(sink_properties);
+                std::sync::LazyLock::new(sinkprops::properties);
             PROPS.as_ref()
         }
 
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
-            set_sink_property(&mut self.settings.lock().unwrap(), value, pspec);
+            sinkprops::set(&mut self.settings.lock().unwrap(), value, pspec);
         }
 
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
-            sink_property(&self.settings.lock().unwrap(), pspec)
+            sinkprops::get(&self.settings.lock().unwrap(), pspec)
         }
 
         fn constructed(&self) {
@@ -76,23 +74,12 @@ mod imp {
         fn pad_templates() -> &'static [gst::PadTemplate] {
             static TEMPLATES: std::sync::LazyLock<Vec<gst::PadTemplate>> =
                 std::sync::LazyLock::new(|| {
-                    let interleaved = gst_audio::AudioCapsBuilder::new_interleaved()
-                        .format(gst_audio::AudioFormat::F32le)
-                        .channels_range(1..=32)
-                        .build();
-                    let planar = gst_audio::AudioCapsBuilder::new()
-                        .format(gst_audio::AudioFormat::F32le)
-                        .layout(gst_audio::AudioLayout::NonInterleaved)
-                        .channels_range(1..=32)
-                        .build();
-                    let mut caps = interleaved;
-                    caps.merge(planar);
                     vec![
                         gst::PadTemplate::new(
                             "sink",
                             gst::PadDirection::Sink,
                             gst::PadPresence::Always,
-                            &caps,
+                            &super::caps(),
                         )
                         .unwrap(),
                     ]
@@ -103,17 +90,16 @@ mod imp {
 
     impl BaseSinkImpl for OmtAudioSink {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
-            let s = self.settings.lock().unwrap().clone();
-            let sender = shared::sender(&s.omt_name, s.port as u16, s.quality, s.advertise)
-                .map_err(|e| {
-                    gst::error_msg!(
-                        gst::ResourceError::OpenWrite,
-                        ["could not start OMT sender {}: {}", s.omt_name, e]
-                    )
-                })?;
-            gst::info!(CAT, imp = self, "publishing audio for {}", s.omt_name);
+            let settings = self.settings.lock().unwrap().clone();
+            let shared = settings.start(self.obj().upcast_ref())?;
+            gst::info!(
+                CAT,
+                imp = self,
+                "publishing audio for {}",
+                settings.omt_name
+            );
             *self.state.lock().unwrap() = Some(State {
-                sender,
+                shared,
                 info: None,
                 planar: Vec::new(),
             });
@@ -173,6 +159,7 @@ mod imp {
             }
             let ts = running_ticks(&*self.obj(), buffer);
             state
+                .shared
                 .sender
                 .lock()
                 .unwrap()
@@ -188,6 +175,21 @@ mod imp {
 
 glib::wrapper! {
     pub struct OmtAudioSink(ObjectSubclass<imp::OmtAudioSink>) @extends gst_base::BaseSink, gst::Element, gst::Object;
+}
+
+pub(crate) fn caps() -> gst::Caps {
+    let mut caps = gst_audio::AudioCapsBuilder::new_interleaved()
+        .format(gst_audio::AudioFormat::F32le)
+        .channels_range(1..=32)
+        .build();
+    caps.merge(
+        gst_audio::AudioCapsBuilder::new()
+            .format(gst_audio::AudioFormat::F32le)
+            .layout(gst_audio::AudioLayout::NonInterleaved)
+            .channels_range(1..=32)
+            .build(),
+    );
+    caps
 }
 
 pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {

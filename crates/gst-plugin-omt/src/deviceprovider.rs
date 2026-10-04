@@ -42,11 +42,51 @@ mod imp {
         }
 
         fn probe(&self) -> Vec<gst::Device> {
-            omt::discovery::discover(PROBE_MS)
+            // Sender info comes from the source itself (sent on connect), so
+            // ask every source at once rather than one after another.
+            let names = omt::discovery::discover(PROBE_MS);
+            let lookups: Vec<_> = names
                 .into_iter()
-                .map(|name| super::OmtDevice::new(&name).upcast())
+                .map(|name| {
+                    std::thread::spawn(move || {
+                        let info = sender_info(&name);
+                        (name, info)
+                    })
+                })
+                .collect();
+            lookups
+                .into_iter()
+                .filter_map(|h| h.join().ok())
+                .map(|(name, info)| super::OmtDevice::new(&name, info.as_ref()).upcast())
                 .collect()
         }
+    }
+
+    /// How long to wait for a source to say who it is.
+    const INFO_MS: u64 = 700;
+
+    /// Connects to `name` without subscribing to anything and waits briefly
+    /// for its sender info. `None` if it has none or does not answer.
+    fn sender_info(name: &str) -> Option<omt::SenderInfo> {
+        let options = omt::ReceiverOptions {
+            video: false,
+            audio: false,
+            metadata: false,
+            quality: None,
+        };
+        let mut rx = omt::BlockingReceiver::connect(name, options).ok()?;
+        rx.set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .ok()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(INFO_MS);
+        while std::time::Instant::now() < deadline {
+            if let Some(info) = rx.sender_info() {
+                return Some(info.clone());
+            }
+            if let Err(omt::Error::Disconnected(_)) = rx.next_frame() {
+                break;
+            }
+        }
+        rx.sender_info().cloned()
     }
 
     #[derive(Default)]
@@ -87,12 +127,17 @@ glib::wrapper! {
 }
 
 impl OmtDevice {
-    fn new(source: &str) -> Self {
+    fn new(source: &str, info: Option<&omt::SenderInfo>) -> Self {
         use gst::subclass::prelude::ObjectSubclassIsExt;
         let caps = gst::Caps::builder("video/x-raw").build();
-        let props = gst::Structure::builder("properties")
-            .field("omt.source", source)
-            .build();
+        let mut props = gst::Structure::builder("properties").field("omt.source", source);
+        if let Some(info) = info {
+            props = props
+                .field("omt.product-name", &info.product_name)
+                .field("omt.manufacturer", &info.manufacturer)
+                .field("omt.version", &info.version);
+        }
+        let props = props.build();
         let device: Self = glib::Object::builder()
             .property("display-name", source)
             .property("device-class", "Source/Video")

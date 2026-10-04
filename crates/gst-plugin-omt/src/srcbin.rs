@@ -1,6 +1,7 @@
 //! `omtsrc`: receives an OMT source's video and/or audio. Request a `video`
 //! pad, an `audio` pad, or both; each is backed by an `omtvideosrc` /
-//! `omtaudiosrc` sharing one time base, so their timestamps line up.
+//! `omtaudiosrc` sharing one drift-corrected timeline, tally, sender info and
+//! statistics.
 
 use gst::glib;
 use gst::prelude::*;
@@ -12,27 +13,20 @@ mod imp {
 
     use super::*;
     use crate::audiosrc::OmtAudioSrc;
-    use crate::shared::{CAT, Quality, TimeBase};
-    use crate::sinkbin::child_template_caps;
+    use crate::shared::{CAT, SourceShared};
+    use crate::srcprops::{self, SrcSettings};
     use crate::videosrc::OmtVideoSrc;
 
-    #[derive(Clone, Default)]
-    struct Settings {
-        source: String,
-        quality: Quality,
-        alpha: bool,
-    }
-
     pub struct OmtSrc {
-        settings: Mutex<Settings>,
-        time_base: Arc<TimeBase>,
+        settings: Mutex<SrcSettings>,
+        shared: Arc<SourceShared>,
     }
 
     impl Default for OmtSrc {
         fn default() -> Self {
             Self {
                 settings: Mutex::default(),
-                time_base: TimeBase::new(),
+                shared: SourceShared::new(),
             }
         }
     }
@@ -47,50 +41,21 @@ mod imp {
     impl ObjectImpl for OmtSrc {
         fn properties() -> &'static [glib::ParamSpec] {
             static PROPS: std::sync::LazyLock<Vec<glib::ParamSpec>> =
-                std::sync::LazyLock::new(|| {
-                    vec![
-                        glib::ParamSpecString::builder("source")
-                            .nick("Source")
-                            .blurb(
-                                "OMT source: a discovered name (\"MACHINE (Name)\") or host:port",
-                            )
-                            .mutable_ready()
-                            .build(),
-                        glib::ParamSpecEnum::builder_with_default("quality", Quality::Standard)
-                            .nick("Quality")
-                            .blurb("Quality to ask the sender for (standard = sender's choice)")
-                            .mutable_ready()
-                            .build(),
-                        glib::ParamSpecBoolean::builder("alpha")
-                            .nick("Alpha")
-                            .blurb(
-                                "Output BGRA, keeping the sender's alpha channel, instead of UYVY",
-                            )
-                            .mutable_ready()
-                            .build(),
-                    ]
-                });
+                std::sync::LazyLock::new(|| srcprops::properties(true));
             PROPS.as_ref()
         }
 
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
-            let mut s = self.settings.lock().unwrap();
-            match pspec.name() {
-                "source" => s.source = value.get::<Option<String>>().unwrap().unwrap_or_default(),
-                "quality" => s.quality = value.get().unwrap(),
-                "alpha" => s.alpha = value.get().unwrap(),
-                _ => unreachable!(),
-            }
+            srcprops::set(
+                &mut self.settings.lock().unwrap(),
+                &self.shared,
+                value,
+                pspec,
+            );
         }
 
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
-            let s = self.settings.lock().unwrap();
-            match pspec.name() {
-                "source" => s.source.to_value(),
-                "quality" => s.quality.to_value(),
-                "alpha" => s.alpha.to_value(),
-                _ => unreachable!(),
-            }
+            srcprops::get(&self.settings.lock().unwrap(), &self.shared, pspec)
         }
     }
 
@@ -113,18 +78,21 @@ mod imp {
         fn pad_templates() -> &'static [gst::PadTemplate] {
             static TEMPLATES: std::sync::LazyLock<Vec<gst::PadTemplate>> =
                 std::sync::LazyLock::new(|| {
-                    let template = |name: &str, factory: &str| {
+                    vec![
                         gst::PadTemplate::new(
-                            name,
+                            "video",
                             gst::PadDirection::Src,
                             gst::PadPresence::Request,
-                            &child_template_caps(factory),
+                            &crate::videosrc::caps(),
                         )
-                        .unwrap()
-                    };
-                    vec![
-                        template("video", "omtvideosrc"),
-                        template("audio", "omtaudiosrc"),
+                        .unwrap(),
+                        gst::PadTemplate::new(
+                            "audio",
+                            gst::PadDirection::Src,
+                            gst::PadPresence::Request,
+                            &crate::audiosrc::caps(),
+                        )
+                        .unwrap(),
                     ]
                 });
             TEMPLATES.as_ref()
@@ -148,14 +116,16 @@ mod imp {
                     .property("source", &s.source)
                     .property("quality", s.quality)
                     .property("alpha", s.alpha)
+                    .property("latency", s.latency_ms)
                     .build();
-                src.set_time_base(self.time_base.clone());
+                src.set_shared(self.shared.clone());
                 src.upcast()
             } else {
                 let src: OmtAudioSrc = glib::Object::builder()
                     .property("source", &s.source)
+                    .property("latency", s.latency_ms)
                     .build();
-                src.set_time_base(self.time_base.clone());
+                src.set_shared(self.shared.clone());
                 src.upcast()
             };
             obj.add(&child).ok()?;

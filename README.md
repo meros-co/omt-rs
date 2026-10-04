@@ -59,6 +59,31 @@ sources; `resolve` turns one into `host:port`. On a PC with several adapters
 (Hyper-V, WSL, Docker), `omt::net::set_preferred_interface` pins listening,
 advertising and browsing to one address.
 
+Tally, sender info and statistics (`omt::metadata`):
+
+```rust
+// Sender: say who you are; hear tally back from every receiver, combined.
+sender.set_sender_info(Some(&omt::SenderInfo {
+    product_name: "Helm".into(), manufacturer: "Meros".into(), version: "1.0".into(),
+}));
+sender.on_tally_changed(|t| println!("program={} preview={}", t.program, t.preview));
+let stats = sender.statistics(); // connections, frames, drops, bytes sent
+
+// Receiver: subscribe to metadata, set your tally, read the source's info.
+let mut rx = BlockingReceiver::connect(name, ReceiverOptions { metadata: true, ..Default::default() })?;
+rx.control()?.send_tally(omt::Tally { program: true, preview: false })?;
+let info = rx.sender_info();     // once received (sent on connect)
+let combined = rx.sender_tally(); // every receiver's tally, as the sender reports it
+```
+
+Clock recovery (`omt::sync`): `ClockRecovery` maps a sender's timestamps onto
+your clock and corrects the drift between them (a phase-locked loop on
+arrival times, using each second's minimum delay so network jitter does not
+move it); `DriftResampler` stretches audio by the measured ppm so it stays
+continuous on that timeline. Shared by a source's video and audio, they keep
+the two in sync with each other and with the local clock indefinitely — the
+tests simulate eight hours at up to 300 ppm and hold A/V within a frame.
+
 ## GStreamer
 
 ```sh
@@ -91,10 +116,44 @@ gst-launch-1.0 videotestsrc is-live=true ! video/x-raw,format=UYVY ! s.video \
 - `omtsink` properties: `omt-name`, `port` (0 = 6960 or any free port),
   `quality` (`low`/`standard`/`high`, the VMX bitrate tier at the same
   resolution) and `advertise`.
-- Timestamps: the sender's OMT timestamps are mapped onto running time with
-  one shared origin per `omtsrc`, so its video and audio stay in sync. There
-  is no drift correction between the sender's clock and the pipeline clock
-  yet.
+- Timestamps and drift: `omtsrc` maps the sender's timestamps onto the
+  pipeline clock through one clock-recovery loop shared by its video and
+  audio, so the two stay in sync, and the drift between the sender's clock
+  and the pipeline's is corrected rather than accumulated (audio is resampled
+  by the measured ppm; video timestamps follow the corrected timeline, so
+  sinks drop or repeat frames as needed). `drift-correction=false` turns it
+  off. `latency` (default 50 ms) is what the source reports for jitter and
+  decoding.
+
+### Tally, sender info and statistics
+
+| | `omtsrc` (and `omtvideosrc` / `omtaudiosrc`) | `omtsink` (and its sinks) |
+|---|---|---|
+| Tally | set `tally-program` / `tally-preview` to tell the source | read `tally-program` / `tally-preview`: any receiver has it on program / preview |
+| Sender info | read `sender-product-name`, `sender-manufacturer`, `sender-version` | set `product-name`, `manufacturer`, `version` |
+| Statistics | `stats` property | `stats` property |
+
+Bus messages (element messages from the `omtsrc` / `omtsink`, or from the
+single element used on its own):
+
+- `omt-stats`, every `stats-interval` ms (default 1000; 0 = off).
+  Source: `connected`, `video-frames`, `audio-frames`, `video-dropped`
+  (frames missing from the sender's timeline), `bytes-received`, `bitrate`
+  (bits/s), `drift-ppm` (settled clock drift, sender vs pipeline),
+  `correction-ppm` (the rate correction applied now), `phase-error-ms`,
+  `jitter-ms` (arrival jitter beyond the minimum delay), `tally-program` /
+  `tally-preview` (ours) and `source-tally-program` / `source-tally-preview`
+  (the combined tally the sender reports). Sink: `connected`, `connections`,
+  `video-frames`, `audio-frames`, `video-dropped` / `audio-dropped` (frames a
+  slow receiver missed), `bytes-sent`, `bitrate`, `tally-program`,
+  `tally-preview`.
+- `omt-tally` when the combined tally changes: `program`, `preview`.
+- `omt-sender-info` on `omtsrc` when the source's info arrives:
+  `product-name`, `manufacturer`, `version`.
+
+`omtdeviceprovider` devices carry `omt.source` and, when the source has set
+them, `omt.product-name`, `omt.manufacturer` and `omt.version` in their
+properties.
 
 ## Compatibility with the official libomt
 
@@ -112,9 +171,14 @@ follows the reference, because that is what is on the wire:
    which cannot be dialled without a scope id.
 4. **Source names are `MACHINE (Name)`** — libomt discards records without the
    parentheses.
+5. **Tally strings keep libomt's typo.** `<OMTTally Preview="true" Program=="false" />`
+   — the double `==` is in libomt and compared exactly, so omt-rs writes it
+   too. A sender ORs every connection's tally, sends its sender info and the
+   current tally to each new connection, and broadcasts tally changes to
+   connections subscribed to metadata, as libomt does.
 
-`tests/interop.rs` checks both directions against the official libomt and runs
-in CI on all three desktop platforms.
+`tests/interop.rs` checks media, tally and sender info in both directions
+against the official libomt and runs in CI on all three desktop platforms.
 
 ## Tests
 
