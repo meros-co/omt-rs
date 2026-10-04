@@ -227,7 +227,9 @@ fn their_sender_to_our_receiver(lib: &LibOmt) {
     let source = unsafe { CStr::from_ptr(buf.as_ptr()) }
         .to_string_lossy()
         .to_string();
-    let port = their_port(&source);
+    let connections: Symbol<unsafe extern "C" fn(*mut c_void) -> c_int> =
+        lib.sym(b"omt_send_connections ");
+    let port = their_port(&source, || unsafe { connections(tx) });
     let mut rx =
         BlockingReceiver::connect(&format!("127.0.0.1:{port}"), ReceiverOptions::default())
             .expect("connect");
@@ -308,22 +310,30 @@ fn their_sender_to_our_receiver(lib: &LibOmt) {
 
 /// The port libomt's sender listens on. Resolving its advertisement with
 /// omt-rs discovery checks that path against libomt too, when multicast works;
-/// otherwise (common on CI runners) fall back to finding the one listener in
-/// OMT's port range on loopback.
-fn their_port(source: &str) -> u16 {
+/// otherwise (common on CI runners) find it in OMT's port range on loopback,
+/// confirming each candidate by watching this sender's connection count rise,
+/// so another OMT sender on the machine cannot be mistaken for it.
+fn their_port(source: &str, connections: impl Fn() -> c_int) -> u16 {
     if std::env::var("OMT_TEST_MDNS").is_ok() {
         let addr = omt::discovery::resolve(source, 5000)
             .unwrap_or_else(|| panic!("omt-rs discovery could not resolve libomt's {source:?}"));
         eprintln!("resolved libomt's advertisement: {source} -> {addr}");
         return addr.rsplit(':').next().unwrap().parse().unwrap();
     }
-    (6400..=6600)
-        .find(|&p| {
-            std::net::TcpStream::connect_timeout(
-                &std::net::SocketAddr::from(([127, 0, 0, 1], p)),
-                Duration::from_millis(50),
-            )
-            .is_ok()
-        })
-        .expect("no libomt listener in 6400-6600")
+    for port in 6400..=6600 {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let Ok(probe) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50))
+        else {
+            continue;
+        };
+        let before = Instant::now();
+        while before.elapsed() < Duration::from_millis(500) {
+            if connections() > 0 {
+                drop(probe);
+                return port;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    panic!("libomt's listener not found in 6400-6600");
 }
