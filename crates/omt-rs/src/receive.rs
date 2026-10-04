@@ -270,6 +270,10 @@ pub struct BlockingReceiver {
     stream: std::net::TcpStream,
     target: String,
     learned: Learned,
+    /// Bytes of a frame read so far. A read timeout can land part way through
+    /// a frame; keeping what arrived lets the next call carry on instead of
+    /// losing those bytes and misreading every frame after them.
+    partial: Vec<u8>,
 }
 
 impl BlockingReceiver {
@@ -293,6 +297,7 @@ impl BlockingReceiver {
             stream,
             target: addr,
             learned: Learned::default(),
+            partial: Vec::new(),
         })
     }
 
@@ -326,30 +331,56 @@ impl BlockingReceiver {
 
     /// Bounds how long [`next_frame`](Self::next_frame) waits; `None` waits
     /// forever. A timeout surfaces as `Error::Io` with kind `WouldBlock` or
-    /// `TimedOut`.
+    /// `TimedOut`, and is safe even part way through a frame: the bytes read
+    /// so far are kept and the next call continues from them.
     pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> Result<(), Error> {
         Ok(self.stream.set_read_timeout(timeout)?)
     }
 
     /// The next frame. `Error::Disconnected` when the sender goes away.
     pub fn next_frame(&mut self) -> Result<Frame, Error> {
-        use std::io::Read;
         loop {
-            let mut buf = [0u8; FrameHeader::SIZE];
-            if let Err(e) = self.stream.read_exact(&mut buf) {
-                return Err(match e.kind() {
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Error::Io(e),
-                    _ => Error::Disconnected(e.to_string()),
-                });
-            }
-            let header = FrameHeader::from_bytes(&buf)?;
-            let mut body = vec![0u8; body_len(&header)?];
-            self.stream.read_exact(&mut body)?;
+            // Header first, then the body its length announces.
+            self.fill(FrameHeader::SIZE)?;
+            let header =
+                FrameHeader::from_bytes(self.partial[..FrameHeader::SIZE].try_into().unwrap())?;
+            let total = FrameHeader::SIZE + body_len(&header)?;
+            self.fill(total)?;
+            let body = self.partial.split_off(FrameHeader::SIZE);
+            self.partial.clear();
             if let Some(frame) = parse(&header, body)? {
                 self.learned.note(&header, &frame);
                 return Ok(frame);
             }
         }
+    }
+
+    /// Reads until `partial` holds at least `want` bytes. On a timeout the
+    /// bytes so far stay in `partial` for the next call.
+    fn fill(&mut self, want: usize) -> Result<(), Error> {
+        use std::io::Read;
+        while self.partial.len() < want {
+            let have = self.partial.len();
+            self.partial.resize(want, 0);
+            match self.stream.read(&mut self.partial[have..]) {
+                Ok(0) => {
+                    self.partial.truncate(have);
+                    return Err(Error::Disconnected("connection closed".into()));
+                }
+                Ok(n) => self.partial.truncate(have + n),
+                Err(e) => {
+                    self.partial.truncate(have);
+                    return Err(match e.kind() {
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                            Error::Io(e)
+                        }
+                        std::io::ErrorKind::Interrupted => continue,
+                        _ => Error::Disconnected(e.to_string()),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Unblocks a `next_frame` waiting on another thread (it returns

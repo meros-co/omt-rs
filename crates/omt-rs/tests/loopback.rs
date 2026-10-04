@@ -394,3 +394,49 @@ fn the_video_format_can_be_set_late_and_changed() {
         assert_eq!((frame.header.height, frame.header.frame_rate_n), (h, 25));
     }
 }
+
+/// A read timeout that lands in the middle of a frame must not lose bytes:
+/// the frame arrives intact on a later call, and the next frame after it too.
+#[test]
+fn a_timeout_part_way_through_a_frame_loses_nothing() {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let first = omt::receive::metadata_frame("<First />");
+        let second = omt::receive::metadata_frame("<Second />");
+        // Half of the header, a pause longer than the receiver's timeout,
+        // then the rest: the timeout fires mid-header and again mid-body.
+        s.write_all(&first[..8]).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+        s.write_all(&first[8..20]).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+        s.write_all(&first[20..]).unwrap();
+        s.write_all(&second).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+    });
+    let mut rx = BlockingReceiver::connect(
+        &format!("127.0.0.1:{port}"),
+        ReceiverOptions {
+            video: false,
+            audio: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    rx.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while got.len() < 2 && Instant::now() < deadline {
+        match rx.next_frame() {
+            Ok(Frame::Metadata { xml, .. }) => got.push(xml),
+            Ok(other) => panic!("unexpected {other:?}"),
+            Err(omt::Error::Io(_)) => {} // timeout: try again
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(got, ["<First />", "<Second />"]);
+    server.join().unwrap();
+}
