@@ -102,7 +102,9 @@ struct Client {
 }
 
 pub struct Sender {
-    encoder: VmxInstance,
+    /// Created on the first video frame (and again after a format change), so
+    /// a sender can exist before its video format is known.
+    encoder: Option<VmxInstance>,
     encoded: Vec<u8>,
     clients: Arc<Mutex<Vec<Client>>>,
     config: SenderConfig,
@@ -114,12 +116,13 @@ pub struct Sender {
 
 impl Sender {
     pub fn new(config: SenderConfig) -> Result<Self, Error> {
-        let (w, h) = (config.width, config.height);
-        if w <= 0 || h <= 0 {
-            return Err(Error::Codec(format!("invalid size {w}x{h}")));
-        }
-        let encoder = VmxInstance::new(w, h, config.profile, config.color_space)
-            .ok_or_else(|| Error::Codec("VMX_Create failed".into()))?;
+        // Fail fast on a configured size the codec rejects; a 0x0 config is
+        // allowed and means "set later with set_video_format".
+        let encoder = if config.width > 0 && config.height > 0 {
+            Some(Self::encoder_for(&config)?)
+        } else {
+            None
+        };
         // Advertise the port actually bound: advertising a requested 0 would
         // publish port 0, and receivers would hang at "connecting".
         let want = if config.port == 0 {
@@ -148,7 +151,7 @@ impl Sender {
         };
         Ok(Self {
             encoder,
-            encoded: vec![0; (w * h * 4) as usize],
+            encoded: Vec::new(),
             clients,
             config,
             port,
@@ -156,6 +159,27 @@ impl Sender {
             stop,
             accept_thread: Some(accept_thread),
         })
+    }
+
+    fn encoder_for(config: &SenderConfig) -> Result<VmxInstance, Error> {
+        let (w, h) = (config.width, config.height);
+        if w <= 0 || h <= 0 {
+            return Err(Error::Codec(format!("invalid video size {w}x{h}")));
+        }
+        VmxInstance::new(w, h, config.profile, config.color_space)
+            .ok_or_else(|| Error::Codec("VMX_Create failed".into()))
+    }
+
+    /// Changes the video size and rate, for senders whose format is learned
+    /// after creation (or changes mid-stream). Takes effect on the next frame.
+    pub fn set_video_format(&mut self, width: i32, height: i32, frame_rate: (i32, i32)) {
+        let c = &mut self.config;
+        if (c.width, c.height) != (width, height) {
+            self.encoder = None;
+        }
+        c.width = width;
+        c.height = height;
+        c.frame_rate = frame_rate;
     }
 
     /// The TCP port receivers connect to.
@@ -180,13 +204,27 @@ impl Sender {
         stride: i32,
         timestamp: i64,
     ) -> Result<SendOutcome, Error> {
+        let (w, h) = (self.config.width, self.config.height);
+        if self.encoder.is_none() {
+            self.encoder = Some(Self::encoder_for(&self.config)?);
+        }
+        let encoder = self.encoder.as_mut().unwrap();
+        let first_plane = (stride.max(0) * h.max(0)) as usize;
+        if pixels.len() < first_plane {
+            return Err(Error::Codec(format!(
+                "{} bytes is too small for a {w}x{h} frame",
+                pixels.len()
+            )));
+        }
         let result = match format {
-            PixelFormat::Bgra => self.encoder.encode_bgra(pixels, stride),
-            PixelFormat::Uyvy => self.encoder.encode_uyvy(pixels, stride),
-            PixelFormat::Uyva => self.encoder.encode_uyva(pixels, stride),
+            PixelFormat::Bgra => encoder.encode_bgra(pixels, stride),
+            PixelFormat::Uyvy => encoder.encode_uyvy(pixels, stride),
+            PixelFormat::Uyva => encoder.encode_uyva(pixels, stride),
         };
         result.map_err(|e| Error::Codec(format!("VMX encode failed ({e})")))?;
-        let len = self.encoder.save_to(&mut self.encoded);
+        // VMX output is bounded by the uncompressed size.
+        self.encoded.resize((w * h * 4) as usize, 0);
+        let len = encoder.save_to(&mut self.encoded);
         if len <= 0 {
             return Err(Error::Codec("VMX_SaveTo returned no data".into()));
         }

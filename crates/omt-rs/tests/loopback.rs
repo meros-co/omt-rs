@@ -351,3 +351,36 @@ fn discovery_finds_an_advertised_sender() {
     let addr = omt::discovery::resolve(name, 5000).expect("resolve");
     assert!(addr.ends_with(&format!(":{}", tx.port())), "{addr}");
 }
+
+/// A sender may be created before its video format is known (a GStreamer sink
+/// learns it from caps) and may change it mid-stream.
+#[test]
+fn the_video_format_can_be_set_late_and_changed() {
+    let mut config = SenderConfig::new("loopback-late", 0, 0, (30, 1));
+    config.advertise = false;
+    let mut tx = Sender::new(config).expect("a 0x0 sender is allowed");
+    let mut rx = connect(
+        &tx,
+        ReceiverOptions {
+            audio: false,
+            ..Default::default()
+        },
+    );
+    for (w, h) in [(W, H), (160, 90)] {
+        tx.set_video_format(w, h, (25, 1));
+        let frame = pump(
+            &mut rx,
+            |ts| {
+                let mut px = vec![100u8; (w * h * 4) as usize];
+                tx.send_video(PixelFormat::Bgra, &mut px, w * 4, ts)
+                    .unwrap();
+            },
+            |f| match f {
+                Frame::Video(v) if v.header.width == w => Some(v),
+                _ => None,
+            },
+        )
+        .unwrap_or_else(|| panic!("no {w}x{h} frame"));
+        assert_eq!((frame.header.height, frame.header.frame_rate_n), (h, 25));
+    }
+}
