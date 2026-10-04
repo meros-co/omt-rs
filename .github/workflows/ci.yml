@@ -43,7 +43,7 @@ jobs:
           dotnet-version: "8.0.x"
       - name: Build the official libomt (Linux/macOS)
         if: runner.os != 'Windows'
-        run: scripts/build-libomt.sh "$RUNNER_TEMP/libomt"
+        run: bash scripts/build-libomt.sh "$RUNNER_TEMP/libomt"
       - name: Build the official libomt (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
