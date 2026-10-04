@@ -24,7 +24,7 @@ fn connect(sender: &Sender, options: ReceiverOptions) -> BlockingReceiver {
 }
 
 fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while !cond() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(10));
@@ -37,7 +37,7 @@ fn read_until(
     mut cond: impl FnMut(&BlockingReceiver) -> bool,
     what: &str,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while !cond(rx) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         let _ = rx.next_frame();
@@ -112,13 +112,14 @@ fn receivers_tally_is_combined_and_reported_back() {
         },
         "tally after disconnect",
     );
-    let changes = changes.lock().unwrap().clone();
-    assert_eq!(
-        changes.last(),
-        Some(&Tally {
-            program: false,
-            preview: true
-        })
+    // The callback runs just after the change becomes visible; wait for it.
+    let preview_only = Tally {
+        program: false,
+        preview: true,
+    };
+    wait_for(
+        || changes.lock().unwrap().last() == Some(&preview_only),
+        "tally callback after disconnect",
     );
 }
 

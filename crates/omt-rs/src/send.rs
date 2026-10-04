@@ -117,6 +117,9 @@ struct Shared {
     /// Combined tally of all receivers, as last broadcast.
     tally: Mutex<Tally>,
     on_tally: Mutex<Option<TallyCallback>>,
+    /// Serialises tally updates: two receivers' threads changing tally at
+    /// once must not broadcast or report the results out of order.
+    tally_update: Mutex<()>,
     video_frames: AtomicU64,
     audio_frames: AtomicU64,
     video_dropped: AtomicU64,
@@ -128,6 +131,7 @@ impl Shared {
     /// Re-ORs every live receiver's tally; if the result changed, sends it to
     /// all metadata-subscribed receivers (as libomt does) and tells the app.
     fn update_tally(&self) {
+        let _in_order = self.tally_update.lock().unwrap();
         let combined = {
             let clients = self.clients.lock().unwrap();
             clients
@@ -153,7 +157,7 @@ impl Shared {
     fn send_metadata(&self, xml: &str) {
         let frame = Arc::new(metadata_frame(xml));
         for c in self.clients.lock().unwrap().iter() {
-            if c.state.metadata.load(Ordering::Relaxed) {
+            if c.state.metadata.load(Ordering::SeqCst) {
                 c.state.pending.lock().unwrap().push_back(frame.clone());
             }
         }
@@ -617,7 +621,19 @@ fn read_from_receiver(mut stream: TcpStream, state: &ClientState, shared: &Share
         match xml {
             commands::SUBSCRIBE_VIDEO => state.video.store(true, Ordering::Relaxed),
             commands::SUBSCRIBE_AUDIO => state.audio.store(true, Ordering::Relaxed),
-            commands::SUBSCRIBE_METADATA => state.metadata.store(true, Ordering::Relaxed),
+            commands::SUBSCRIBE_METADATA => {
+                state.metadata.store(true, Ordering::SeqCst);
+                // Changes are broadcast only to metadata subscribers, so one
+                // that happened while this subscribe was in flight would be
+                // missed for good. Send the current state now; a duplicate of
+                // what went out on accept is harmless.
+                let mut pending = state.pending.lock().unwrap();
+                if let Some(info) = shared.sender_info.lock().unwrap().as_deref() {
+                    pending.push_back(Arc::new(metadata_frame(info)));
+                }
+                let tally = *shared.tally.lock().unwrap();
+                pending.push_back(Arc::new(metadata_frame(tally.to_xml())));
+            }
             _ => {
                 if let Some(tally) = Tally::from_xml(xml) {
                     *state.tally.lock().unwrap() = tally;
