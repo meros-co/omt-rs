@@ -76,9 +76,13 @@ gst-inspect-1.0 omt
 | `omtdeviceprovider` | lists sources on the network through `GstDeviceMonitor` |
 
 ```sh
-gst-launch-1.0 omtsrc source="STUDIO (Program)" name=s     s.video ! videoconvert ! autovideosink     s.audio ! audioconvert ! autoaudiosink
+gst-launch-1.0 omtsrc source="STUDIO (Program)" name=s \
+    s.video ! videoconvert ! autovideosink \
+    s.audio ! audioconvert ! autoaudiosink
 
-gst-launch-1.0 videotestsrc is-live=true ! video/x-raw,format=UYVY ! s.video     audiotestsrc is-live=true ! audio/x-raw,format=F32LE,rate=48000 ! s.audio     omtsink name=s omt-name=Test
+gst-launch-1.0 videotestsrc is-live=true ! video/x-raw,format=UYVY ! s.video \
+    audiotestsrc is-live=true ! audio/x-raw,format=F32LE,rate=48000 ! s.audio \
+    omtsink name=s omt-name=Test
 ```
 
 - `source` is a discovered name (`MACHINE (Name)`) or `host:port`.
