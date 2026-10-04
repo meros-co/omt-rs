@@ -159,11 +159,15 @@ fn gradient_bgra() -> Vec<u8> {
 
 #[test]
 fn interop_with_the_official_libomt() {
-    let lib = LibOmt::load();
-    our_sender_to_their_receiver(&lib);
-    their_sender_to_our_receiver(&lib);
-    tally_and_info_with_their_receiver(&lib);
-    tally_and_info_with_their_sender(&lib);
+    // Never unloaded: the .NET runtime inside libomt registers a thread-exit
+    // destructor on every thread that calls it, and on Linux dlclose really
+    // unmaps the code, so dropping the library before this thread exits
+    // crashes it (SIGSEGV) after every check has passed.
+    let lib: &'static LibOmt = Box::leak(Box::new(LibOmt::load()));
+    our_sender_to_their_receiver(lib);
+    their_sender_to_our_receiver(lib);
+    tally_and_info_with_their_receiver(lib);
+    tally_and_info_with_their_sender(lib);
     let shutdown: Option<Symbol<unsafe extern "C" fn()>> =
         unsafe { lib.lib.get(b"omt_shutdown\0") }.ok();
     if let Some(shutdown) = shutdown {
