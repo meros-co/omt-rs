@@ -1,0 +1,37 @@
+[package]
+name = "omt-rs"
+version = "0.1.0"
+description = "Open Media Transport (OMT) in Rust: send, receive, discovery and the VMX codec"
+readme = "../../README.md"
+keywords = ["omt", "video", "broadcast", "vmx", "streaming"]
+categories = ["multimedia::video", "network-programming"]
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+# `use omt::...` - the package name only differs because `omt` is taken on
+# crates.io by an unrelated project.
+name = "omt"
+
+[features]
+default = ["tokio"]
+# The async Receiver (tokio). The blocking receiver and the sender need no
+# runtime and are always available.
+tokio = ["dep:tokio"]
+# Interop tests against the official libomt (see tests/interop.rs).
+interop = ["dep:libloading"]
+
+[dependencies]
+bytes = "1"
+log = "0.4"
+mdns-sd = "0.11"
+tokio = { version = "1", features = ["net", "io-util", "rt", "time"], optional = true }
+libloading = { version = "0.8", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt", "rt-multi-thread", "time", "macros"] }
+
+[build-dependencies]
+cc = "1"
