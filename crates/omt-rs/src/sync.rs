@@ -74,7 +74,7 @@ impl ClockRecovery {
                 self.state = None;
             }
         }
-        let l = self.state.get_or_insert_with(|| Loop {
+        let l = self.state.get_or_insert(Loop {
             anchor_ts: ts,
             anchor_ns: arrival,
             rate: 1.0,
@@ -125,9 +125,17 @@ impl ClockRecovery {
     }
 
     /// Measured drift of the local clock against the sender's, in ppm
-    /// (positive: local runs fast). Settles within a few minutes.
+    /// (positive: local runs fast). Settles within a few minutes; it is the
+    /// loop's integrator, so network jitter cannot push it around.
     pub fn drift_ppm(&self) -> f64 {
         self.state.as_ref().map_or(0.0, |l| l.integrator * 1e6)
+    }
+
+    /// The rate correction being applied right now, in ppm: the settled
+    /// drift plus the loop's current phase correction. Follows a change in
+    /// seconds, where [`drift_ppm`](Self::drift_ppm) takes minutes.
+    pub fn correction_ppm(&self) -> f64 {
+        self.state.as_ref().map_or(0.0, |l| (l.rate - 1.0) * 1e6)
     }
 
     /// How far the minimum arrival delay currently sits from where the loop
