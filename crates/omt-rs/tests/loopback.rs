@@ -222,6 +222,55 @@ fn uyva_is_flagged_as_alpha() {
     assert_ne!(frame.header.flags & video_flags::ALPHA, 0);
 }
 
+/// The alpha plane itself survives the round trip, not just the flag: a
+/// transparent left half and an opaque right half come back that way.
+#[test]
+fn uyva_alpha_plane_round_trips() {
+    let mut tx = sender("loopback-alpha-plane");
+    let mut rx = connect(
+        &tx,
+        ReceiverOptions {
+            audio: false,
+            ..Default::default()
+        },
+    );
+    let (w, h) = (W as usize, H as usize);
+    let mut src = vec![128u8; DecodeFormat::Uyva.frame_size(W, H)];
+    for (i, a) in src[w * h * 2..].iter_mut().enumerate() {
+        *a = if i % w < w / 2 { 0 } else { 255 };
+    }
+    let frame = pump(
+        &mut rx,
+        |ts| {
+            let mut px = src.clone();
+            tx.send_video(PixelFormat::Uyva, &mut px, W * 2, ts)
+                .unwrap();
+        },
+        |f| match f {
+            Frame::Video(v) => Some(v),
+            _ => None,
+        },
+    )
+    .expect("no video frame arrived");
+
+    let mut out = vec![0u8; DecodeFormat::Uyva.frame_size(W, H)];
+    VmxDecoder::new()
+        .decode(&frame.data, W, H, DecodeFormat::Uyva, &mut out, W * 2)
+        .expect("decode");
+    let alpha = &out[w * h * 2..];
+    // Sample away from the edge, where the codec may blur the step.
+    for y in [h / 4, h / 2, 3 * h / 4] {
+        assert!(
+            alpha[y * w + w / 8] < 16,
+            "left half should stay transparent"
+        );
+        assert!(
+            alpha[y * w + 7 * w / 8] > 239,
+            "right half should stay opaque"
+        );
+    }
+}
+
 /// A receiver that never reads must not slow the sender: frames for it are
 /// dropped (and reported) instead.
 #[test]
