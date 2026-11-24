@@ -55,7 +55,9 @@ loop {
 ```
 
 Discover: `omt::discovery::discover(timeout_ms)` lists `MACHINE (Name)`
-sources; `resolve` turns one into `host:port`. On a PC with several adapters
+sources once; `omt::discovery::watch(|names| …)` keeps browsing and reports
+the full list whenever a source appears or goes away, until the returned
+handle is dropped; `resolve` turns a name into `host:port`. On a PC with several adapters
 (Hyper-V, WSL, Docker), `omt::net::set_preferred_interface` pins listening,
 advertising and browsing to one address.
 

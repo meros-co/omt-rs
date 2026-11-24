@@ -489,3 +489,38 @@ fn a_timeout_part_way_through_a_frame_loses_nothing() {
     assert_eq!(got, ["<First />", "<Second />"]);
     server.join().unwrap();
 }
+
+/// A watch reports an advertised sender, then its removal. Opt-in like the
+/// test above:
+///
+///     OMT_TEST_MDNS=1 cargo test the_watch_reports_a_sender
+#[test]
+fn the_watch_reports_a_sender_coming_and_going() {
+    if std::env::var("OMT_TEST_MDNS").is_err() {
+        eprintln!("OMT_TEST_MDNS not set - skipping mDNS watch test");
+        return;
+    }
+    use std::sync::{Arc, Mutex};
+    omt::discovery::set_machine_name("OMTRSWATCH");
+    let lists: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+    let seen = lists.clone();
+    let _watch = omt::discovery::watch(move |l| seen.lock().unwrap().push(l)).expect("watch");
+    let advertiser = omt::discovery::Advertiser::new("Watched", 6499).expect("advertise");
+    let name = omt::discovery::full_source_name("Watched");
+    let latest_has = |want: bool| {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(15) {
+            let has = lists.lock().unwrap().last().is_some_and(|l| l.contains(&name));
+            if has == want {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    };
+    assert!(latest_has(true), "{name} never appeared: {:?}", lists.lock().unwrap());
+    drop(advertiser);
+    assert!(latest_has(false), "{name}'s removal was never reported");
+    let all = lists.lock().unwrap();
+    assert!(all.windows(2).all(|w| w[0] != w[1]), "repeated a list: {all:?}");
+}

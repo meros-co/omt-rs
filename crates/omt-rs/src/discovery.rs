@@ -5,7 +5,9 @@
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -63,7 +65,11 @@ pub fn full_source_name(name: &str) -> String {
 /// The OMT source name of a resolved service, e.g. "HOST (Source)" — the
 /// instance label with the `._omt._tcp.local.` suffix stripped.
 fn instance_name(info: &ServiceInfo) -> String {
-    let full = info.get_fullname();
+    name_of(info.get_fullname())
+}
+
+/// The OMT source name in a service's full name.
+fn name_of(full: &str) -> String {
     full.strip_suffix(&format!(".{SERVICE_TYPE}"))
         .unwrap_or(full)
         .replace("\\ ", " ")
@@ -93,6 +99,63 @@ pub fn discover(timeout_ms: u64) -> Vec<String> {
     }
     let _ = daemon.shutdown();
     names.into_iter().collect()
+}
+
+/// A running [`watch`]; dropping it stops browsing.
+pub struct Watch {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// How long the first report waits for answers, so it isn't an empty list
+/// sent a moment before the first sources resolve.
+const SETTLE: Duration = Duration::from_millis(1500);
+
+/// Browses for OMT sources until the returned [`Watch`] is dropped, calling
+/// `on_change` on its own thread with the full, sorted list whenever a
+/// source appears or goes away. The first call comes after a short settle,
+/// even with no sources.
+pub fn watch(on_change: impl Fn(Vec<String>) + Send + 'static) -> Result<Watch, String> {
+    let daemon = ServiceDaemon::new().map_err(|e| format!("mDNS: {e}"))?;
+    crate::net::restrict_mdns(&daemon);
+    let rx = daemon.browse(SERVICE_TYPE).map_err(|e| format!("mDNS browse: {e}"))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let thread = std::thread::Builder::new()
+        .name("omt-discovery".into())
+        .spawn(move || {
+            let started = Instant::now();
+            let mut names = BTreeSet::new();
+            let mut reported: Option<BTreeSet<String>> = None;
+            while !flag.load(Ordering::Relaxed) {
+                match rx.recv_timeout(Duration::from_millis(250)) {
+                    Ok(ServiceEvent::ServiceResolved(info)) => {
+                        names.insert(instance_name(&info));
+                    }
+                    Ok(ServiceEvent::ServiceRemoved(_, full)) => {
+                        names.remove(&name_of(&full));
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+                let settled = started.elapsed() >= SETTLE;
+                if settled && reported.as_ref() != Some(&names) {
+                    on_change(names.iter().cloned().collect());
+                    reported = Some(names.clone());
+                }
+            }
+            let _ = daemon.shutdown();
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(Watch { stop, thread: Some(thread) })
 }
 
 /// Resolves an OMT source name to a `host:port` string. Blocks up to
