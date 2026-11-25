@@ -124,6 +124,30 @@ fn receivers_tally_is_combined_and_reported_back() {
 }
 
 #[test]
+fn a_tally_sent_straight_after_connecting_counts() {
+    // The receiver's tally can arrive before the sender has listed the new
+    // connection; it must still reach the combined tally.
+    for i in 0..20 {
+        let tx = sender(&format!("early tally {i}"));
+        let rx = connect(
+            &tx,
+            ReceiverOptions {
+                metadata: true,
+                ..Default::default()
+            },
+        );
+        rx.control()
+            .unwrap()
+            .send_tally(Tally {
+                program: true,
+                preview: false,
+            })
+            .unwrap();
+        wait_for(|| tx.tally().program, "program tally at the sender");
+    }
+}
+
+#[test]
 fn sender_info_reaches_receivers_on_connect_and_on_change() {
     let tx = sender("info");
     let first = SenderInfo {

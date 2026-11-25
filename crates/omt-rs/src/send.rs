@@ -512,6 +512,9 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>, stop: Arc<AtomicBool>
             Ok((stream, _)) => {
                 if let Some(client) = start_client(stream, &shared) {
                     shared.clients.lock().unwrap().push(client);
+                    // A tally the receiver sent before it was listed here
+                    // was left out of the combined tally: count it now.
+                    shared.update_tally();
                 }
             }
             Err(_) => std::thread::sleep(Duration::from_millis(50)),
