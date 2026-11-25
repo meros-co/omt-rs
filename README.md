@@ -66,7 +66,7 @@ Tally, sender info and statistics (`omt::metadata`):
 ```rust
 // Sender: say who you are; hear tally back from every receiver, combined.
 sender.set_sender_info(Some(&omt::SenderInfo {
-    product_name: "Helm".into(), manufacturer: "Meros".into(), version: "1.0".into(),
+    product_name: "Example".into(), manufacturer: "Meros".into(), version: "1.0".into(),
 }));
 sender.on_tally_changed(|t| println!("program={} preview={}", t.program, t.preview));
 let stats = sender.statistics(); // connections, frames, drops, bytes sent

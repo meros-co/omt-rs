@@ -62,7 +62,7 @@ jobs:
         shell: bash
         run: OMT_LIB_DIR="$RUNNER_TEMP/libomt" cargo test -p omt-rs --features interop --test interop
 
-  # Mobile targets build (DrawLive ships omt-rs on Android and iOS).
+  # Mobile targets build (apps ship omt-rs on Android and iOS).
   android:
     name: Build (Android)
     runs-on: ubuntu-latest

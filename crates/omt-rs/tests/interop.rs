@@ -416,7 +416,7 @@ fn tally_and_info_with_their_receiver(lib: &LibOmt) {
     config.advertise = false;
     let mut tx = Sender::new(config).expect("sender");
     let info = SenderInfo {
-        product_name: "Helm".into(),
+        product_name: "Example".into(),
         manufacturer: "Meros".into(),
         version: "1.2.3".into(),
     };
@@ -448,7 +448,7 @@ fn tally_and_info_with_their_receiver(lib: &LibOmt) {
         || {
             pump(&mut tx);
             unsafe { get_info(rx, &mut *got_info) };
-            RefSenderInfo::get(&got_info.product_name) == "Helm"
+            RefSenderInfo::get(&got_info.product_name) == "Example"
         },
         "libomt receiver reading omt-rs sender info",
     );

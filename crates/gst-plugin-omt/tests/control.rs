@@ -63,7 +63,7 @@ fn tally_and_sender_info_flow_between_omtsrc_and_omtsink() {
     let sender = pipeline(&format!(
         "videotestsrc is-live=true ! video/x-raw,format=UYVY,width=320,height=180,framerate=30/1 ! s.video \
          omtsink name=s omt-name=gst-tally port={port} advertise=false \
-         product-name=Helm manufacturer=Meros version=1.0 stats-interval=200"
+         product-name=Example manufacturer=Meros version=1.0 stats-interval=200"
     ));
     sender.set_state(gst::State::Playing).unwrap();
     std::thread::sleep(Duration::from_millis(300));
@@ -76,9 +76,9 @@ fn tally_and_sender_info_flow_between_omtsrc_and_omtsink() {
 
     // Sender info: message on the receiver's bus, then the properties.
     let info = wait_message(&receiver, "omt-sender-info", |_| true);
-    assert_eq!(info.get::<&str>("product-name").unwrap(), "Helm");
+    assert_eq!(info.get::<&str>("product-name").unwrap(), "Example");
     assert_eq!(info.get::<&str>("manufacturer").unwrap(), "Meros");
-    assert_eq!(r.property::<String>("sender-product-name"), "Helm");
+    assert_eq!(r.property::<String>("sender-product-name"), "Example");
     assert_eq!(r.property::<String>("sender-version"), "1.0");
 
     // The application puts the source on program at the receiver...

@@ -151,7 +151,7 @@ fn a_tally_sent_straight_after_connecting_counts() {
 fn sender_info_reaches_receivers_on_connect_and_on_change() {
     let tx = sender("info");
     let first = SenderInfo {
-        product_name: "Helm".into(),
+        product_name: "Example".into(),
         manufacturer: "Meros".into(),
         version: "1.0".into(),
     };

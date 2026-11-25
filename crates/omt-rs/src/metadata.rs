@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn sender_info_round_trips_and_escapes() {
         let info = SenderInfo {
-            product_name: "Helm \"Pro\" & <More>".into(),
+            product_name: "Example \"Pro\" & <More>".into(),
             manufacturer: "Meros".into(),
             version: "1.2.3".into(),
         };
